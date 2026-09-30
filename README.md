@@ -23,7 +23,7 @@ flowchart TD
     Store --> State[(state.sqlite3)]
 ```
 
-`bot.py` handles commands, messages, inline buttons, and owner access checks. It serializes workflow actions with an `asyncio.Lock` and runs synchronous workflow operations in worker threads with `asyncio.to_thread`. `service.py` coordinates parsing, searches, selections, playlist creation, insertion, and recovery independently of Telegram presentation.
+`bot.py` handles commands, messages, inline buttons, and owner access checks. At startup and on `/start`, it registers the Telegram command menu for the owner's private chat. It serializes workflow actions with an `asyncio.Lock` and runs synchronous workflow operations in worker threads with `asyncio.to_thread`. `service.py` coordinates parsing, searches, selections, playlist creation, insertion, and recovery independently of Telegram presentation.
 
 `search.py` performs unauthenticated song searches and converts results into shared models. `youtube.py` manages OAuth credentials and official API calls. `store.py` saves a single draft as JSON in a SQLite row, with each save committed in a transaction. `models.py` defines the draft, track, and candidate dataclasses; `config.py` supplies environment configuration and runtime paths.
 
@@ -112,7 +112,18 @@ The dependency ranges below are declared in `pyproject.toml`; the Docker image u
 
    The `auth` command opens your default browser and saves the Google OAuth token to `%LOCALAPPDATA%\ym_playlist_maker\token.json`. The bot also stores `state.sqlite3` there. These files contain sensitive data: restrict directory access to your Windows user and do not copy the token into the repository. To use a different directory, set `YM_DATA_DIR` before running both commands.
 
-4. Send the bot a list, for example:
+4. Open the bot's private chat and send `/start`. The **Menu** button next to the message input opens these commands:
+
+   | Command | Action |
+   |---------|--------|
+   | `/start` | Show how to send a song list |
+   | `/resume` | Continue the saved draft |
+   | `/cancel` | Cancel the draft before playlist creation |
+   | `/edit <source line>` | Change a selected or skipped recording before creation; add the source line number after selecting `/edit` from the menu |
+
+   The menu is configured automatically on every bot startup and on `/start`; no BotFather setup is required. Restart a local bot after updating the code, or rebuild the Docker service with `docker compose up --build -d`. If the owner has not opened the chat yet, or Telegram rejects the menu update, the bot logs a warning and keeps running; `/start` retries the setup.
+
+   Send the bot a list, for example:
 
    ```text
    Oasis — Wonderwall

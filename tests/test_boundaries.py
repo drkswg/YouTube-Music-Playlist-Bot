@@ -2,11 +2,15 @@ import asyncio
 import threading
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
+from telegram import BotCommandScopeChat, MenuButtonCommands
 from telegram.constants import ChatType
+from telegram.error import BadRequest
+from telegram.ext import CommandHandler
 
-from ym_playlist_maker.bot import BotUI
+from ym_playlist_maker.bot import BotUI, build_application
 from ym_playlist_maker.config import BotConfig
 from ym_playlist_maker.models import Candidate, Draft, Track
 from ym_playlist_maker.service import UnconfirmedInsert
@@ -95,6 +99,86 @@ class CollectMessage:
 
     async def reply_text(self, text, **kwargs):
         self.sent.append((text, kwargs))
+
+
+def test_application_startup_registers_owner_menu_for_all_command_handlers(monkeypatch):
+    commands = AsyncMock()
+    menu = AsyncMock()
+    monkeypatch.setattr("telegram.ext.ExtBot.set_my_commands", commands)
+    monkeypatch.setattr("telegram.ext.ExtBot.set_chat_menu_button", menu)
+    app = build_application(BotConfig("123:dummy", 123, Path("unused")), workflow=None)
+
+    assert app.post_init is not None
+    asyncio.run(app.post_init(app))
+
+    commands.assert_awaited_once()
+    registered = commands.await_args.args[0]
+    assert [command.command for command in registered] == ["start", "resume", "cancel", "edit"]
+    handled = {command for handler in app.handlers[0] if isinstance(handler, CommandHandler)
+               for command in handler.commands}
+    assert {command.command for command in registered} == handled
+    assert all(command.description for command in registered)
+    assert "/edit <source line>" in registered[-1].description
+    assert commands.await_args.kwargs == {"scope": BotCommandScopeChat(123)}
+    menu.assert_awaited_once_with(chat_id=123, menu_button=MenuButtonCommands())
+
+
+@pytest.mark.parametrize("user_id,chat_type,allowed", [
+    (123, ChatType.PRIVATE, True),
+    (456, ChatType.PRIVATE, False),
+    (123, ChatType.GROUP, False),
+])
+def test_start_configures_menu_only_for_owner_private_chat(user_id, chat_type, allowed):
+    bot = SimpleNamespace(set_my_commands=AsyncMock(), set_chat_menu_button=AsyncMock())
+    ui = BotUI(BotConfig("dummy", 123, Path("unused")), workflow=None)
+    message = CollectMessage()
+    update = SimpleNamespace(
+        effective_user=SimpleNamespace(id=user_id),
+        effective_chat=SimpleNamespace(type=chat_type), effective_message=message,
+    )
+    context = SimpleNamespace(application=SimpleNamespace(bot=bot))
+    asyncio.run(ui.start(update, context))
+
+    if allowed:
+        bot.set_my_commands.assert_awaited_once()
+        assert bot.set_my_commands.await_args.kwargs["scope"] == BotCommandScopeChat(123)
+        bot.set_chat_menu_button.assert_awaited_once_with(chat_id=123, menu_button=MenuButtonCommands())
+        assert "Menu button" in message.sent[0][0]
+    else:
+        bot.set_my_commands.assert_not_awaited()
+        bot.set_chat_menu_button.assert_not_awaited()
+        assert not message.sent
+
+
+@pytest.mark.parametrize("failed_method", ["set_my_commands", "set_chat_menu_button"])
+def test_menu_failure_keeps_startup_and_start_help_available(monkeypatch, caplog, failed_method):
+    commands = AsyncMock()
+    menu = AsyncMock()
+    methods = {"set_my_commands": commands, "set_chat_menu_button": menu}
+    methods[failed_method].side_effect = BadRequest("chat not found: sensitive provider detail")
+    for name, method in methods.items():
+        monkeypatch.setattr(f"telegram.ext.ExtBot.{name}", method)
+    app = build_application(BotConfig("123:dummy", 123, Path("unused")), workflow=None)
+    message = CollectMessage()
+    update = SimpleNamespace(
+        effective_user=SimpleNamespace(id=123),
+        effective_chat=SimpleNamespace(type=ChatType.PRIVATE), effective_message=message,
+    )
+    start_handler = next(handler for handler in app.handlers[0]
+                         if isinstance(handler, CommandHandler) and "start" in handler.commands)
+
+    async def run():
+        await app.post_init(app)
+        # Once /start creates the chat or Telegram recovers, setup is retried.
+        methods[failed_method].side_effect = None
+        await start_handler.callback(update, SimpleNamespace(application=app))
+
+    asyncio.run(run())
+    assert commands.await_count == 2
+    assert menu.await_count == (1 if failed_method == "set_my_commands" else 2)
+    assert "Send a list" in message.sent[0][0]
+    assert "Could not configure command menu (BadRequest)" in caplog.text
+    assert "sensitive provider detail" not in caplog.text
 
 
 def test_candidate_message_shows_album_and_duration():

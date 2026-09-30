@@ -3,8 +3,9 @@
 import asyncio
 import logging
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import BotCommand, BotCommandScopeChat, InlineKeyboardButton, InlineKeyboardMarkup, MenuButtonCommands, Update
 from telegram.constants import ChatType
+from telegram.error import TelegramError
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
 from .config import BotConfig
@@ -65,6 +66,24 @@ class BotUI:
         self.workflow = workflow
         self.lock = asyncio.Lock()
 
+    async def configure_menu(self, application: Application) -> None:
+        try:
+            await application.bot.set_my_commands(
+                [
+                    BotCommand("start", "How to send a song list"),
+                    BotCommand("resume", "Continue the saved draft"),
+                    BotCommand("cancel", "Cancel the draft before creation"),
+                    BotCommand("edit", "Change a recording: /edit <source line>"),
+                ],
+                scope=BotCommandScopeChat(self.config.owner_id),
+            )
+            await application.bot.set_chat_menu_button(
+                chat_id=self.config.owner_id, menu_button=MenuButtonCommands(),
+            )
+        except TelegramError as exc:
+            # The owner's chat may not exist until their first /start.
+            log.warning("Could not configure command menu (%s); use /start to retry", type(exc).__name__)
+
     def allowed(self, update: Update) -> bool:
         return bool(
             update.effective_user
@@ -73,11 +92,12 @@ class BotUI:
             and update.effective_chat.type == ChatType.PRIVATE
         )
 
-    async def start(self, update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
+    async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if self.allowed(update):
+            await self.configure_menu(context.application)
             await update.effective_message.reply_text(
                 "Send a list with one song per line, for example Oasis — Wonderwall. "
-                "Commands: /resume, /cancel, /edit <source line>."
+                "Commands: /resume, /cancel, /edit <source line>. Use the Menu button to see all commands."
             )
 
     async def cancel(self, update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -351,7 +371,7 @@ class BotUI:
 
 def build_application(config: BotConfig, workflow: PlaylistWorkflow) -> Application:
     ui = BotUI(config, workflow)
-    app = Application.builder().token(config.token).build()
+    app = Application.builder().token(config.token).post_init(ui.configure_menu).build()
     app.add_handler(CommandHandler("start", ui.start))
     app.add_handler(CommandHandler("cancel", ui.cancel))
     app.add_handler(CommandHandler("resume", ui.resume))
