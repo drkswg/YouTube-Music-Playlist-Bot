@@ -107,6 +107,56 @@ def test_candidate_message_shows_album_and_duration():
     asyncio.run(ui._show_state(SimpleNamespace(effective_message=message)))
     assert "Album X" in message.sent[0][0]
     assert "3:42" in message.sent[0][0]
+    assert "confirm a recording from the saved search results" in message.sent[0][0]
+
+
+@pytest.mark.parametrize("candidates,reason", [
+    ([Candidate("one", "Song", ["Artist"]), Candidate("two", "Song", ["Artist"])], "durations are missing"),
+    ([Candidate("one", "Song (Live)", ["Artist"])], "requested version was not found"),
+    ([Candidate("one", "Song (Demo)", ["Artist"])], "labels are unclear"),
+    ([Candidate("one", "Song", ["Cover Artist"])], "title and artist do not match"),
+    ([], "No matches"),
+])
+def test_resolution_message_explains_manual_selection(candidates, reason):
+    track = Track("Artist", "Song", 1, candidates=candidates, search_query="Artist Song", search_revision=3)
+    draft = Draft("draft123", [track])
+    before = draft.to_dict()
+    ui = BotUI(BotConfig("dummy", 123, Path("unused")), SimpleNamespace(next_unresolved=lambda: (draft, 0)))
+    message = CollectMessage()
+    asyncio.run(ui._show_state(SimpleNamespace(effective_message=message)))
+    assert reason in message.sent[0][0]
+    assert draft.to_dict() == before
+
+
+def test_hidden_results_and_button_indices_use_persisted_snapshot():
+    candidates = [Candidate(f"id{i}", "Song", ["Artist"], duration=f"3:{40 + i}") for i in range(10)]
+    track = Track("Artist", "Song", 1, candidates=candidates, search_query="Artist Song", search_revision=9)
+    draft = Draft("draft123", [track])
+    before = draft.to_dict()
+    ui = BotUI(BotConfig("dummy", 123, Path("unused")), SimpleNamespace(next_unresolved=lambda: (draft, 0)))
+    message = CollectMessage()
+    asyncio.run(ui._show_state(SimpleNamespace(effective_message=message)))
+    text, options = message.sent[0]
+    assert "different durations" in text
+    assert "Showing 5 of 10 results; 5 more are hidden" in text
+    assert [row[0].callback_data for row in options["reply_markup"].inline_keyboard[:5]] == [
+        f"d:draft123:pick:0:9:{i}" for i in range(5)
+    ]
+    assert draft.to_dict() == before
+
+
+def test_ui_preserves_legacy_order_when_new_rules_would_choose_studio():
+    track = Track("Artist", "Song", 1, candidates=[
+        Candidate("live", "Song (Live)", ["Artist"]), Candidate("studio", "Song", ["Artist"]),
+    ], search_query="Artist Song", search_revision=4)
+    draft = Draft("draft123", [track])
+    ui = BotUI(BotConfig("dummy", 123, Path("unused")), SimpleNamespace(next_unresolved=lambda: (draft, 0)))
+    message = CollectMessage()
+    asyncio.run(ui._show_state(SimpleNamespace(effective_message=message)))
+    text, options = message.sent[0]
+    assert "confirm a recording from the saved search results" in text
+    assert text.index("1. Song (Live)") < text.index("2. Song")
+    assert options["reply_markup"].inline_keyboard[0][0].callback_data == "d:draft123:pick:0:4:0"
 
 
 def test_confirmation_lists_every_selection_in_telegram_safe_chunks():

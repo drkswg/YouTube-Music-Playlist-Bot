@@ -7,7 +7,7 @@ from uuid import uuid4
 from googleapiclient.errors import HttpError
 
 from .models import Draft, Track
-from .parser import exact_matches, parse_tracks
+from .parser import parse_tracks, resolve_candidates
 from .store import DraftStore
 from .youtube import BeforeInsertError, http_error_reason
 
@@ -71,7 +71,7 @@ class PlaylistWorkflow:
         query = query.strip()
         if not query or len(query) > 200:
             raise WorkflowError("Enter a search query between 1 and 200 characters long")
-        self._search_into(draft, track, query)
+        self._search_into(draft, track, query, is_custom=True)
         track.await_query = False
         self.store.save(draft)
         return draft
@@ -253,14 +253,14 @@ class PlaylistWorkflow:
         self.store.save(draft)
         return draft
 
-    def _search_into(self, draft: Draft, track: Track, query: str) -> None:
+    def _search_into(self, draft: Draft, track: Track, query: str, *, is_custom: bool = False) -> None:
         candidates = self.search.songs(query)
-        track.candidates = candidates
+        decision = resolve_candidates(track, candidates, is_custom=is_custom)
+        track.candidates = list(decision.ordered_candidates)
         track.search_query = query
         track.search_revision += 1
-        exact = exact_matches(track, candidates)
-        if len(exact) == 1:
-            track.selected = exact[0].video_id
+        if decision.selected_video_id is not None:
+            track.selected = decision.selected_video_id
             track.status = "selected"
         self.store.save(draft)
 

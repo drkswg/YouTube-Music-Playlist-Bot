@@ -9,9 +9,23 @@ from telegram.ext import Application, CallbackQueryHandler, CommandHandler, Cont
 
 from .config import BotConfig
 from .models import Draft, selected_candidate
+from .parser import resolve_candidates
 from .service import PlaylistWorkflow, UnconfirmedInsert, WorkflowError
 
 log = logging.getLogger(__name__)
+
+
+_RESOLUTION_MESSAGES = {
+    "no_results": "No matches. Try another query or skip this song.",
+    "no_confident_match": "The title and artist do not match confidently. Please choose a recording.",
+    "version_unavailable": "The requested version was not found (a studio recording is preferred by default). Please choose a version or try another search.",
+    "unsupported_qualifier": "Some version labels are unclear or conflicting. Please check the recordings.",
+    "multiple_recordings": "Several recordings match the requested version. Please choose one.",
+    "different_credits": "Matching recordings have different artist credits. Please choose one.",
+    "duration_unknown": "Several releases match, but their durations are missing or invalid. Please choose a recording.",
+    "different_durations": "Matching releases have different durations and may be different recordings. Please choose one.",
+    "custom_search": "Please choose a recording from your search results.",
+}
 
 
 class BotUI:
@@ -173,13 +187,21 @@ class BotUI:
             rows.append([InlineKeyboardButton("Try another search", callback_data=f"{base}retry:{index}:{track.search_revision}")])
             rows.append([InlineKeyboardButton("Skip", callback_data=f"{base}skip:{index}:{track.search_revision}")])
             text = f"{index + 1}/{len(draft.tracks)}: {track.artist} — {track.title}"
-            if not track.candidates:
-                text += "\nNo matches. Try another query or skip this song."
-            else:
+            # Explain the persisted snapshot without changing its order, revision
+            # or pending status. Canonical custom queries cannot be distinguished
+            # in old JSON, so an automatic decision receives a neutral prompt.
+            decision = resolve_candidates(
+                track, track.candidates,
+                is_custom=track.search_query != f"{track.artist} {track.title}",
+            )
+            text += "\n" + _RESOLUTION_MESSAGES.get(decision.reason, "Please confirm a recording from the saved search results.")
+            if track.candidates:
                 for i, candidate in enumerate(track.candidates[:5], start=1):
                     album = f" · album: {candidate.album}" if candidate.album else ""
                     duration = f" · {candidate.duration}" if candidate.duration else ""
                     text += f"\n{i}. {candidate.title} — {', '.join(candidate.artists)}{album}{duration}"[:600]
+                if len(track.candidates) > 5:
+                    text += f"\nShowing 5 of {len(track.candidates)} results; {len(track.candidates) - 5} more are hidden. Try another search to narrow the results."
             await update.effective_message.reply_text(text, reply_markup=InlineKeyboardMarkup(rows))
         elif draft.phase == "title":
             await update.effective_message.reply_text("Selection complete. Send a title for the new playlist.")

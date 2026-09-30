@@ -22,8 +22,8 @@ class FakeSearch:
             return [Candidate("oasis", "Wonderwall", ["Oasis"])]
         if "Numb" in query:
             return [
-                Candidate("numb1", "Numb", ["Linkin Park"], "Original"),
-                Candidate("numb2", "Numb", ["Linkin Park"], "Live"),
+                Candidate("numb1", "Numb", ["Linkin Park"], "Meteora"),
+                Candidate("numb2", "Numb", ["Linkin Park"], "Collection"),
             ]
         return []
 
@@ -344,4 +344,101 @@ def test_insertion_history_bypasses_readiness_retries(setup, status, revision):
     assert caught.value is error
     assert youtube.events == [("read", "playlist1")]
     assert youtube.items == []
+
+
+class StaticSearch:
+    def __init__(self, candidates):
+        self.candidates = candidates
+        self.calls = []
+
+    def songs(self, query):
+        self.calls.append(query)
+        return list(self.candidates)
+
+
+def test_studio_plus_live_auto_selects_and_persists(setup):
+    workflow, youtube, store = setup
+    workflow.search = StaticSearch([
+        Candidate("live", "Numb", ["Linkin Park"], "Live"),
+        Candidate("studio", "Numb", ["Linkin Park"], "Meteora"),
+    ])
+    workflow.start("Linkin Park — Numb")
+    draft, index = workflow.next_unresolved()
+    assert index is None and draft.phase == "title"
+    assert store.load().tracks[0].selected == "studio"
+    assert [c.video_id for c in draft.tracks[0].candidates] == ["studio", "live"]
+    assert draft.tracks[0].search_revision == 1
+    assert youtube.items == []
+
+
+@pytest.mark.parametrize("query", ["Linkin Park Numb", "some custom query"])
+def test_custom_search_is_manual_in_raw_order_even_for_canonical_query(setup, query):
+    workflow, _, store = setup
+    workflow.start("Linkin Park — Numb")
+    draft, index = workflow.next_unresolved()
+    old_revision = draft.tracks[0].search_revision
+    workflow.search = StaticSearch([
+        Candidate("cover", "Numb", ["Another Artist"]),
+        Candidate("studio", "Numb", ["Linkin Park"]),
+    ])
+    draft = workflow.search_again(index, query)
+    assert draft.tracks[0].status == "pending" and draft.tracks[0].selected is None
+    assert draft.tracks[0].search_revision == old_revision + 1
+    assert [c.video_id for c in draft.tracks[0].candidates] == ["cover", "studio"]
+    recovered = PlaylistWorkflow(store, workflow.search, workflow.youtube)
+    snapshot, index = recovered.next_unresolved()
+    assert snapshot.to_dict() == draft.to_dict() and index == 0
+    with pytest.raises(WorkflowError, match="search results have changed"):
+        recovered.choose(0, 0, old_revision)
+    assert recovered.choose(0, 1, draft.tracks[0].search_revision).tracks[0].selected == "studio"
+
+
+def test_legacy_pending_snapshot_is_not_auto_selected_or_reordered(setup):
+    workflow, _, store = setup
+    draft, _ = workflow.start("Linkin Park — Numb")
+    track = draft.tracks[0]
+    track.candidates = [
+        Candidate("live", "Numb (Live)", ["Linkin Park"]),
+        Candidate("studio", "Numb", ["Linkin Park"]),
+    ]
+    track.search_query = "Linkin Park Numb"
+    track.search_revision = 7
+    store.save(draft)
+    expected = draft.to_dict()
+    workflow.search = StaticSearch([])
+    snapshot, index = workflow.next_unresolved()
+    assert index == 0 and snapshot.to_dict() == expected
+    assert workflow.search.calls == []
+    assert workflow.choose(0, 0, 7).tracks[0].selected == "live"
+
+
+def test_fresh_search_ranks_late_relevant_results_before_persisting_buttons(setup):
+    workflow, _, store = setup
+    covers = [Candidate(f"cover{i}", "Numb", ["Cover Artist"]) for i in range(8)]
+    workflow.search = StaticSearch(covers + [
+        Candidate("one", "Numb", ["Linkin Park"], duration="3:00"),
+        Candidate("two", "Numb", ["Linkin Park"], duration="4:00"),
+    ])
+    workflow.start("Linkin Park — Numb")
+    draft, index = workflow.next_unresolved()
+    track = draft.tracks[index]
+    assert track.status == "pending" and len(track.candidates) == 10
+    assert [c.video_id for c in store.load().tracks[0].candidates[:2]] == ["one", "two"]
+    assert workflow.choose(index, 1, track.search_revision).tracks[index].selected == "two"
+
+
+def test_search_failure_leaves_saved_snapshot_and_revision_intact(setup):
+    workflow, _, store = setup
+    workflow.start("Linkin Park — Numb")
+    draft, _ = workflow.next_unresolved()
+    expected = draft.to_dict()
+
+    class FailingSearch:
+        def songs(self, query):
+            raise TimeoutError("offline")
+
+    workflow.search = FailingSearch()
+    with pytest.raises(TimeoutError, match="offline"):
+        workflow.search_again(0, "new query")
+    assert store.load().to_dict() == expected
 
