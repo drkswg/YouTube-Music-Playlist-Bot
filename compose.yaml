@@ -1,0 +1,13 @@
+services:
+  bot:
+    build: .
+    environment:
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:?Set TELEGRAM_BOT_TOKEN in .env}
+      TELEGRAM_OWNER_ID: ${TELEGRAM_OWNER_ID:?Set TELEGRAM_OWNER_ID in .env}
+      YM_DATA_DIR: /app/data
+    volumes:
+      - type: bind
+        source: ./data
+        target: /app/data
+    restart: on-failure
+    init: true
