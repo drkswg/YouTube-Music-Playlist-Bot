@@ -12,7 +12,19 @@ class DraftStore:
         path.parent.mkdir(parents=True, exist_ok=True)
         self._db = sqlite3.connect(path, check_same_thread=False)
         self._db.execute("CREATE TABLE IF NOT EXISTS draft (slot INTEGER PRIMARY KEY CHECK(slot = 1), data TEXT NOT NULL)")
+        self._db.execute("CREATE TABLE IF NOT EXISTS preferences (name TEXT PRIMARY KEY, value TEXT NOT NULL)")
         self._db.commit()
+
+    def get_language(self) -> str | None:
+        row = self._db.execute("SELECT value FROM preferences WHERE name = 'language'").fetchone()
+        return row[0] if row else None
+
+    def set_language(self, language: str) -> None:
+        with self._db:
+            self._db.execute(
+                "INSERT INTO preferences(name, value) VALUES('language', ?) "
+                "ON CONFLICT(name) DO UPDATE SET value = excluded.value", (language,),
+            )
 
     def load(self) -> Draft | None:
         row = self._db.execute("SELECT data FROM draft WHERE slot = 1").fetchone()

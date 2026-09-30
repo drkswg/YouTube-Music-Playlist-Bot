@@ -9,6 +9,7 @@ from telegram.error import TelegramError
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
 from .config import BotConfig
+from .i18n import LANGUAGES, translate, translate_saved_message
 from .models import Draft, SelectionRecord, selected_candidate
 from .parser import resolve_candidates
 from .service import PlaylistWorkflow, UnconfirmedInsert, WorkflowError
@@ -29,12 +30,12 @@ _RESOLUTION_MESSAGES = {
 }
 
 
-def selection_fallback_message(record: SelectionRecord) -> str:
+def selection_fallback_message(record: SelectionRecord, language: str = "en") -> str:
     """Describe only safe categories, never provider messages or arbitrary codes."""
     if record.status == "attempted":
-        return "Automatic selection was interrupted. The saved search will not be sent again. Please choose manually."
+        return translate(language, "Automatic selection was interrupted. The saved search will not be sent again. Please choose manually.")
     if record.status == "abstained":
-        return "Gemini could not choose confidently. Please choose manually."
+        return translate(language, "Gemini could not choose confidently. Please choose manually.")
     details = {
         "api_key_invalid": "Gemini rejected the API key. Check GEMINI_API_KEY.",
         "service_disabled": "Gemini API is disabled for this project. Check the project configuration.",
@@ -57,7 +58,7 @@ def selection_fallback_message(record: SelectionRecord) -> str:
         "response_too_large": "Gemini's response exceeds the automatic selection response limit.",
     }
     text = details.get(record.error_detail) or categories.get(record.error_code)
-    return (text or "Automatic selection is unavailable.") + " Please choose manually."
+    return translate(language, text or "Automatic selection is unavailable.") + " " + translate(language, "Please choose manually.")
 
 
 class BotUI:
@@ -65,15 +66,23 @@ class BotUI:
         self.config = config
         self.workflow = workflow
         self.lock = asyncio.Lock()
+        # Production workflows always have a store; lightweight UI fakes need not.
+        self.store = getattr(workflow, "store", None)
+        saved_language = self.store.get_language() if self.store is not None else None
+        self.language_code = saved_language if saved_language in LANGUAGES else "en"
+
+    def _t(self, text: str, **values) -> str:
+        return translate(self.language_code, text, **values)
 
     async def configure_menu(self, application: Application) -> None:
         try:
             await application.bot.set_my_commands(
                 [
-                    BotCommand("start", "How to send a song list"),
-                    BotCommand("resume", "Continue the saved draft"),
-                    BotCommand("cancel", "Cancel the draft before creation"),
-                    BotCommand("edit", "Change a recording: /edit <source line>"),
+                    BotCommand("start", self._t("How to send a song list")),
+                    BotCommand("resume", self._t("Continue the saved draft")),
+                    BotCommand("cancel", self._t("Cancel the draft before creation")),
+                    BotCommand("edit", self._t("Change a recording: /edit <source line>")),
+                    BotCommand("language", self._t("Choose the interface language")),
                 ],
                 scope=BotCommandScopeChat(self.config.owner_id),
             )
@@ -94,11 +103,51 @@ class BotUI:
 
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if self.allowed(update):
-            await self.configure_menu(context.application)
-            await update.effective_message.reply_text(
-                "Send a list with one song per line, for example Oasis — Wonderwall. "
-                "Commands: /resume, /cancel, /edit <source line>. Use the Menu button to see all commands."
+            async with self.lock:
+                await self.configure_menu(context.application)
+                await update.effective_message.reply_text(self._t(
+                    "Send a list with one song per line, for example Oasis — Wonderwall. "
+                    "Commands: /resume, /cancel, /edit <source line>, /language. Use the Menu button to see all commands."
+                ))
+
+    async def language(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self.allowed(update):
+            return
+        async with self.lock:
+            try:
+                if context.args:
+                    if len(context.args) == 1 and context.args[0].lower() in LANGUAGES:
+                        await self._set_language(update, context, context.args[0].lower())
+                    else:
+                        await self._show_languages(update, invalid=True)
+                else:
+                    await self._show_languages(update)
+            except Exception as exc:
+                await self._error(update, exc)
+
+    async def _show_languages(self, update: Update, *, invalid: bool = False) -> None:
+        buttons = [
+            InlineKeyboardButton(
+                ("✓ " if code == self.language_code else "") + name, callback_data=f"lang:{code}",
             )
+            for code, name in LANGUAGES.items()
+        ]
+        text = self._t("Choose a language. Current language: {language}.", language=LANGUAGES[self.language_code])
+        if invalid:
+            text = self._t("Unsupported language. Use /language or /language en, ru, es, de, fr, pt.") + "\n" + text
+        await update.effective_message.reply_text(
+            text, reply_markup=InlineKeyboardMarkup([buttons[i:i + 2] for i in range(0, len(buttons), 2)]),
+        )
+
+    async def _set_language(self, update: Update, context: ContextTypes.DEFAULT_TYPE, code: str) -> None:
+        if self.store is not None:
+            await asyncio.to_thread(self.store.set_language, code)
+        self.language_code = code
+        await self.configure_menu(context.application)
+        await update.effective_message.reply_text(self._t(
+            "Language saved: {language}. Use /resume to continue a saved draft or send a song list.",
+            language=LANGUAGES[code],
+        ))
 
     async def cancel(self, update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
         if not self.allowed(update):
@@ -106,7 +155,7 @@ class BotUI:
         async with self.lock:
             try:
                 await asyncio.to_thread(self.workflow.cancel)
-                await update.effective_message.reply_text("Draft cancelled.")
+                await update.effective_message.reply_text(self._t("Draft cancelled."))
             except Exception as exc:
                 await self._error(update, exc)
 
@@ -129,7 +178,7 @@ class BotUI:
             try:
                 draft = await asyncio.to_thread(self.workflow.active)
                 if not draft:
-                    await update.effective_message.reply_text("No draft. Send a list of songs.")
+                    await update.effective_message.reply_text(self._t("No draft. Send a list of songs."))
                 elif draft.phase in ("creating", "writing"):
                     draft = await self._publish(update)
                     await self._done(update, draft)
@@ -153,21 +202,21 @@ class BotUI:
                         await asyncio.to_thread(self.workflow.search_again, pending[0], update.effective_message.text)
                         await self._show_state(update)
                     else:
-                        await update.effective_message.reply_text("First select a version using a button or use /cancel.")
+                        await update.effective_message.reply_text(self._t("First select a version using a button or use /cancel."))
                 elif draft and draft.phase in ("confirm", "creating", "writing"):
-                    await update.effective_message.reply_text("Use the confirmation button or /resume.")
+                    await update.effective_message.reply_text(self._t("Use the confirmation button or /resume."))
                 else:
                     _, invalid = await asyncio.to_thread(self.workflow.start, update.effective_message.text)
                     if invalid:
                         await update.effective_message.reply_text(
-                            "Correct the lines that do not follow the Artist — Song format: " + ", ".join(map(str, invalid))
+                            self._t("Correct the lines that do not follow the Artist — Song format: {lines}", lines=", ".join(map(str, invalid)))
                         )
                     else:
                         await self._show_state(update)
             except Exception as exc:
                 await self._error(update, exc)
 
-    async def callback(self, update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
+    async def callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         query = update.callback_query
         if not query:
             return
@@ -177,6 +226,12 @@ class BotUI:
         async with self.lock:
             try:
                 parts = (query.data or "").split(":")
+                if parts[0] == "lang":
+                    if len(parts) == 2 and parts[1] in LANGUAGES:
+                        await self._set_language(update, context, parts[1])
+                    else:
+                        await self._show_languages(update, invalid=True)
+                    return
                 if len(parts) < 3 or parts[0] != "d":
                     raise WorkflowError("Invalid button")
                 draft = await asyncio.to_thread(self.workflow.active)
@@ -189,7 +244,7 @@ class BotUI:
                     await asyncio.to_thread(self.workflow.skip, int(parts[3]), int(parts[4]))
                 elif action == "retry" and len(parts) == 5:
                     await asyncio.to_thread(self.workflow.request_search_again, int(parts[3]), int(parts[4]))
-                    await update.effective_message.reply_text("Send a new search query for this song.")
+                    await update.effective_message.reply_text(self._t("Send a new search query for this song."))
                     return
                 elif action == "create" and len(parts) in (3, 4):
                     expected = int(parts[3]) if len(parts) == 4 else 0
@@ -204,13 +259,13 @@ class BotUI:
                     return
                 elif action == "cancel" and len(parts) == 3:
                     await asyncio.to_thread(self.workflow.cancel)
-                    await update.effective_message.reply_text("Draft cancelled.")
+                    await update.effective_message.reply_text(self._t("Draft cancelled."))
                     return
                 else:
                     raise WorkflowError("Invalid button")
                 await self._show_state(update)
             except (ValueError, IndexError):
-                await update.effective_message.reply_text("Invalid button; use /resume.")
+                await update.effective_message.reply_text(self._t("Invalid button; use /resume."))
             except Exception as exc:
                 await self._error(update, exc)
 
@@ -221,7 +276,7 @@ class BotUI:
             future = None
             notification = None
             try:
-                notification = update.effective_message.reply_text("The playlist is still being created. Please wait.")
+                notification = update.effective_message.reply_text(self._t("The playlist is still being created. Please wait."))
                 future = asyncio.run_coroutine_threadsafe(notification, loop)
                 future.result(timeout=10)
             except Exception:
@@ -246,7 +301,7 @@ class BotUI:
                 future = None
                 try:
                     notification = update.effective_message.reply_text(
-                        f"Gemini is choosing a recording for source line {line} ({total} songs). Please wait."
+                        self._t("Gemini is choosing a recording for source line {line} ({total} songs). Please wait.", line=line, total=total)
                     )
                     future = asyncio.run_coroutine_threadsafe(notification, loop)
                     future.result(timeout=10)
@@ -263,7 +318,8 @@ class BotUI:
             track = draft.tracks[index]
             if track.await_query:
                 await update.effective_message.reply_text(
-                    f"{index + 1}/{len(draft.tracks)}: waiting for a new search query for {track.artist} — {track.title}."
+                    self._t("{index}/{total}: waiting for a new search query for {artist} — {title}.",
+                            index=index + 1, total=len(draft.tracks), artist=track.artist, title=track.title)
                 )
                 return
             base = f"d:{draft.draft_id}:"
@@ -274,8 +330,8 @@ class BotUI:
                 )]
                 for i, candidate in enumerate(track.candidates[:5])
             ]
-            rows.append([InlineKeyboardButton("Try another search", callback_data=f"{base}retry:{index}:{track.search_revision}")])
-            rows.append([InlineKeyboardButton("Skip", callback_data=f"{base}skip:{index}:{track.search_revision}")])
+            rows.append([InlineKeyboardButton(self._t("Try another search"), callback_data=f"{base}retry:{index}:{track.search_revision}")])
+            rows.append([InlineKeyboardButton(self._t("Skip"), callback_data=f"{base}skip:{index}:{track.search_revision}")])
             text = f"{index + 1}/{len(draft.tracks)}: {track.artist} — {track.title}"
             # Explain the persisted snapshot without changing its order, revision
             # or pending status. Canonical custom queries cannot be distinguished
@@ -284,19 +340,19 @@ class BotUI:
                 track, track.candidates,
                 is_custom=track.search_query != f"{track.artist} {track.title}",
             )
-            text += "\n" + _RESOLUTION_MESSAGES.get(decision.reason, "Please confirm a recording from the saved search results.")
+            text += "\n" + self._t(_RESOLUTION_MESSAGES.get(decision.reason, "Please confirm a recording from the saved search results."))
             if track.selection_record:
-                text += "\n" + selection_fallback_message(track.selection_record)
+                text += "\n" + selection_fallback_message(track.selection_record, self.language_code)
             if track.candidates:
                 for i, candidate in enumerate(track.candidates[:5], start=1):
-                    album = f" · album: {candidate.album}" if candidate.album else ""
+                    album = self._t(" · album: {album}", album=candidate.album) if candidate.album else ""
                     duration = f" · {candidate.duration}" if candidate.duration else ""
                     text += f"\n{i}. {candidate.title} — {', '.join(candidate.artists)}{album}{duration}"[:600]
                 if len(track.candidates) > 5:
-                    text += f"\nShowing 5 of {len(track.candidates)} results; {len(track.candidates) - 5} more are hidden. Try another search to narrow the results."
+                    text += "\n" + self._t("Showing 5 of {total} results; {hidden} more are hidden. Try another search to narrow the results.", total=len(track.candidates), hidden=len(track.candidates) - 5)
             await update.effective_message.reply_text(text, reply_markup=InlineKeyboardMarkup(rows))
         elif draft.phase == "title":
-            await update.effective_message.reply_text("Selection complete. Send a title for the new playlist.")
+            await update.effective_message.reply_text(self._t("Selection complete. Send a title for the new playlist."))
         elif draft.phase == "confirm":
             selected = [t for t in draft.tracks if t.status == "selected"]
             skipped = [t.source_line for t in draft.tracks if t.status == "skipped"]
@@ -308,34 +364,34 @@ class BotUI:
                     continue
                 detail = f"{track.source_line}. {candidate.title} — {', '.join(candidate.artists)}"
                 if candidate.album:
-                    detail += f" · album: {candidate.album}"
+                    detail += self._t(" · album: {album}", album=candidate.album)
                 if candidate.duration:
                     detail += f" · {candidate.duration}"
                 if candidate.video_id in seen:
-                    detail += " · duplicate will be skipped"
+                    detail += self._t(" · duplicate will be skipped")
                 seen.add(candidate.video_id)
                 lines.append(detail[:700])
             if skipped:
-                lines.append("Skipped lines: " + ", ".join(map(str, skipped)))
-            await self._send_lines(update, [f"{draft.title}: selected recordings"] + lines)
+                lines.append(self._t("Skipped lines: {lines}", lines=", ".join(map(str, skipped))))
+            await self._send_lines(update, [self._t("{title}: selected recordings", title=draft.title)] + lines)
             base = f"d:{draft.draft_id}:"
             rows = [[
-                InlineKeyboardButton("Create private playlist", callback_data=base + f"create:{draft.review_revision}"),
-                InlineKeyboardButton("Cancel", callback_data=base + "cancel"),
+                InlineKeyboardButton(self._t("Create private playlist"), callback_data=base + f"create:{draft.review_revision}"),
+                InlineKeyboardButton(self._t("Cancel"), callback_data=base + "cancel"),
             ]]
-            summary = f"Reviewed {len(selected)} selected entries. Use /edit <source line> to change a recording. Create a private playlist?"
+            summary = self._t("Reviewed {count} selected entries. Use /edit <source line> to change a recording. Create a private playlist?", count=len(selected))
             await update.effective_message.reply_text(summary, reply_markup=InlineKeyboardMarkup(rows))
         elif draft.phase == "done":
             await self._done(update, draft)
 
     async def _done(self, update: Update, draft) -> None:
         if draft.phase != "done":
-            await update.effective_message.reply_text("Writing is not complete yet. Use /resume.")
+            await update.effective_message.reply_text(self._t("Writing is not complete yet. Use /resume."))
             return
         added = sum(t.status == "added" for t in draft.tracks)
-        message = f"Done: {added} songs. https://music.youtube.com/playlist?list={draft.playlist_id}"
+        message = self._t("Done: {added} songs. {url}", added=added, url=f"https://music.youtube.com/playlist?list={draft.playlist_id}")
         if draft.errors:
-            message += "\n" + "\n".join(draft.errors)
+            message += "\n" + "\n".join(translate_saved_message(self.language_code, error) for error in draft.errors)
         await update.effective_message.reply_text(message[:4000])
 
     async def _send_lines(self, update: Update, lines: list[str]) -> None:
@@ -351,22 +407,22 @@ class BotUI:
 
     async def _error(self, update: Update, exc: Exception) -> None:
         log.exception("Workflow failed", exc_info=exc)
-        detail = str(exc) if isinstance(exc, WorkflowError) else f"{type(exc).__name__}: {exc}"
+        detail = translate_saved_message(self.language_code, str(exc)) if isinstance(exc, WorkflowError) else f"{type(exc).__name__}: {exc}"
         if isinstance(exc, UnconfirmedInsert):
             draft = await asyncio.to_thread(self.workflow.active)
             if draft:
                 button = InlineKeyboardButton(
-                    "I checked the playlist; retry insertion",
+                    self._t("I checked the playlist; retry insertion"),
                     callback_data=f"d:{draft.draft_id}:retryinsert:{exc.index}:{exc.revision}",
                 )
                 await update.effective_message.reply_text(
-                    "The outcome of the previous insertion is unknown. Open the playlist and make sure "
+                    self._t("The outcome of the previous insertion is unknown. Open the playlist and make sure "
                     "this recording is absent. Retrying may create a duplicate if YouTube shows the recording later.\n"
-                    + detail,
+                    ) + detail,
                     reply_markup=InlineKeyboardMarkup([[button]]),
                 )
                 return
-        await update.effective_message.reply_text(("Error: " + detail + "\nUse /resume to continue.")[:4000])
+        await update.effective_message.reply_text(self._t("Error: {detail}\nUse /resume to continue.", detail=detail)[:4000])
 
 
 def build_application(config: BotConfig, workflow: PlaylistWorkflow) -> Application:
@@ -376,6 +432,7 @@ def build_application(config: BotConfig, workflow: PlaylistWorkflow) -> Applicat
     app.add_handler(CommandHandler("cancel", ui.cancel))
     app.add_handler(CommandHandler("resume", ui.resume))
     app.add_handler(CommandHandler("edit", ui.edit))
+    app.add_handler(CommandHandler("language", ui.language))
     app.add_handler(CallbackQueryHandler(ui.callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, ui.text))
     return app

@@ -113,12 +113,12 @@ def test_application_startup_registers_owner_menu_for_all_command_handlers(monke
 
     commands.assert_awaited_once()
     registered = commands.await_args.args[0]
-    assert [command.command for command in registered] == ["start", "resume", "cancel", "edit"]
+    assert [command.command for command in registered] == ["start", "resume", "cancel", "edit", "language"]
     handled = {command for handler in app.handlers[0] if isinstance(handler, CommandHandler)
                for command in handler.commands}
     assert {command.command for command in registered} == handled
     assert all(command.description for command in registered)
-    assert "/edit <source line>" in registered[-1].description
+    assert "/edit <source line>" in next(command.description for command in registered if command.command == "edit")
     assert commands.await_args.kwargs == {"scope": BotCommandScopeChat(123)}
     menu.assert_awaited_once_with(chat_id=123, menu_button=MenuButtonCommands())
 

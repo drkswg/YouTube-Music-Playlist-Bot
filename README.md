@@ -6,6 +6,8 @@ A Telegram bot that accepts a list in `Artist — Song` format (one entry per li
 
 The project is designed for personal use by a single Telegram owner in a private chat. It supports recording selection, custom search queries, skipping tracks, a playlist title, and a review of the selected recordings before creation. A saved draft allows the owner to continue after a restart or an external service error using `/resume`.
 
+Use `/language` to choose English, Russian, Spanish, German, French, or Portuguese. The selected interface language applies to messages, buttons, and the owner's command menu, and is saved independently of the playlist draft.
+
 ## Architecture
 
 The application runs as a single process with separate layers for Telegram interaction, workflow rules, external services, and persistence. `__main__.py` reads configuration and connects these components for the `bot` command; the `auth` command performs local Google OAuth authorization.
@@ -25,7 +27,7 @@ flowchart TD
 
 `bot.py` handles commands, messages, inline buttons, and owner access checks. At startup and on `/start`, it registers the Telegram command menu for the owner's private chat. It serializes workflow actions with an `asyncio.Lock` and runs synchronous workflow operations in worker threads with `asyncio.to_thread`. `service.py` coordinates parsing, searches, selections, playlist creation, insertion, and recovery independently of Telegram presentation.
 
-`search.py` performs unauthenticated song searches and converts results into shared models. `youtube.py` manages OAuth credentials and official API calls. `store.py` saves a single draft as JSON in a SQLite row, with each save committed in a transaction. `models.py` defines the draft, track, and candidate dataclasses; `config.py` supplies environment configuration and runtime paths.
+`search.py` performs unauthenticated song searches and converts results into shared models. `youtube.py` manages OAuth credentials and official API calls. `store.py` saves a single draft as JSON in a SQLite row and the owner's language preference in a separate table, with each save committed in a transaction. `i18n.py` translates Telegram presentation and saved workflow diagnostics without changing music metadata or draft contents. `models.py` defines the draft, track, and candidate dataclasses; `config.py` supplies environment configuration and runtime paths.
 
 ## Approach
 
@@ -58,6 +60,7 @@ ym_playlist_maker/
 │       ├── __main__.py           # auth and bot CLI entry points
 │       ├── bot.py                # Telegram commands, messages, and inline buttons
 │       ├── config.py             # Environment configuration and data directory
+│       ├── i18n.py               # Interface translations for six languages
 │       ├── models.py             # Draft, track, and search candidate models
 │       ├── parser.py             # Track list parsing and normalized exact matching
 │       ├── search.py             # YouTube Music search adapter
@@ -68,6 +71,7 @@ ym_playlist_maker/
 ├── tests/
 │   ├── test_auth.py              # OAuth configuration, callback, and token storage
 │   ├── test_boundaries.py        # API requests and Telegram interaction boundaries
+│   ├── test_languages.py         # Language selection, persistence, and localized UI
 │   ├── test_parser.py            # Input parsing and matching rules
 │   ├── test_selection.py         # Gemini contracts, eligibility, persistence, and editing
 │   └── test_workflow.py          # State transitions, retries, and write reconciliation
@@ -120,8 +124,11 @@ The dependency ranges below are declared in `pyproject.toml`; the Docker image u
    | `/resume` | Continue the saved draft |
    | `/cancel` | Cancel the draft before playlist creation |
    | `/edit <source line>` | Change a selected or skipped recording before creation; add the source line number after selecting `/edit` from the menu |
+   | `/language` | Choose the interface language using buttons; `/language ru` selects Russian directly |
 
    The menu is configured automatically on every bot startup and on `/start`; no BotFather setup is required. Restart a local bot after updating the code, or rebuild the Docker service with `docker compose up --build -d`. If the owner has not opened the chat yet, or Telegram rejects the menu update, the bot logs a warning and keeps running; `/start` retries the setup.
+
+   `/language` shows language names in their own languages and marks the current choice. You can also use `/language en`, `/language ru`, `/language es`, `/language de`, `/language fr`, or `/language pt`. English is the default until a language is selected. The preference survives restarts, draft cancellation, and playlist completion. Changing it updates the command menu immediately and applies to subsequent messages; use `/resume` to display the saved draft in the new language. Previously sent messages retain their text and valid draft buttons keep working. Song titles, artist names, playlist titles, and technical details from external services retain their original text. No additional configuration is required.
 
    Send the bot a list, for example:
 
