@@ -1,6 +1,97 @@
 # Personal YouTube Music Playlist Bot
 
+## Project Description
+
 A Telegram bot that accepts a list in `Artist — Song` format (one entry per line), searches YouTube Music, and creates a **private** playlist in your Google account. It runs on your Windows PC while the long-polling process is active, either locally or through Docker Compose. Search uses the unofficial `ytmusicapi`; playlist creation and track insertion use the official YouTube Data API.
+
+The project is designed for personal use by a single Telegram owner in a private chat. It supports recording selection, custom search queries, skipping tracks, a playlist title, and a review of the selected recordings before creation. A saved draft allows the owner to continue after a restart or an external service error using `/resume`.
+
+## Architecture
+
+The application runs as a single process with separate layers for Telegram interaction, workflow rules, external services, and persistence. `__main__.py` reads configuration and connects these components for the `bot` command; the `auth` command performs local Google OAuth authorization.
+
+```mermaid
+flowchart TD
+    Owner[Telegram owner] --> Bot[bot.py: async Telegram UI]
+    Bot --> Workflow[service.py: playlist workflow]
+    Workflow --> Parser[parser.py: parsing and exact matching]
+    Workflow --> Search[search.py: YouTube Music search]
+    Workflow --> YouTube[youtube.py: OAuth and playlist operations]
+    Workflow --> Store[store.py: SQLite draft storage]
+    Search --> Music[YouTube Music via ytmusicapi]
+    YouTube --> API[YouTube Data API v3]
+    Store --> State[(state.sqlite3)]
+```
+
+`bot.py` handles commands, messages, inline buttons, and owner access checks. It serializes workflow actions with an `asyncio.Lock` and runs synchronous workflow operations in worker threads with `asyncio.to_thread`. `service.py` coordinates parsing, searches, selections, playlist creation, insertion, and recovery independently of Telegram presentation.
+
+`search.py` performs unauthenticated song searches and converts results into shared models. `youtube.py` manages OAuth credentials and official API calls. `store.py` saves a single draft as JSON in a SQLite row, with each save committed in a transaction. `models.py` defines the draft, track, and candidate dataclasses; `config.py` supplies environment configuration and runtime paths.
+
+## Approach
+
+The workflow follows a persisted sequence: `resolving` → `title` → `confirm` → `creating` → `writing` → `done`.
+
+1. **Parse the input.** Accept one artist/title pair per line, including common numbering and dash separators. Report invalid line numbers before starting a draft.
+2. **Resolve recordings conservatively.** Automatically select a candidate only when exactly one result matches both the normalized title and an artist name. Otherwise, let the owner choose a version, enter another search query, or skip the track.
+3. **Review before writing.** Ask for a playlist title and show the selected recordings, including album and duration when available, before the owner confirms creation.
+4. **Create and populate the playlist.** Create a private playlist, save its ID, and insert selected recordings in input order. Repeated video IDs are skipped. Before the first insertion attempt, wait for playlist availability and retry only `404 playlistNotFound` reads, up to three attempts.
+5. **Recover through reconciliation.** Persist creation and insertion attempts before sending writes. On `/resume`, identify an uncertain playlist creation by its draft marker and compare remote playlist contents with the expected track order before continuing. An absent track after an uncertain insertion requires an explicit retry after the owner checks the playlist; unexpected external changes stop writing.
+
+The application keeps one active draft, validates buttons against draft IDs and search or insertion revisions, and allows cancellation before creation starts. Automated tests use fake external services and temporary storage so that workflow recovery can be checked without network access or credentials.
+
+## Folder Structure
+
+```text
+ym_playlist_maker/
+├── README.md                    # Project documentation and operating instructions
+├── pyproject.toml               # Package metadata, dependencies, and pytest settings
+├── Dockerfile                   # Python 3.12 container image
+├── compose.yaml                 # Bot service, environment, and data bind mount
+├── .env.example                 # Example Telegram configuration
+├── .gitignore                   # Local state, secrets, and generated file exclusions
+├── .dockerignore                # Container build context exclusions
+├── AGENTS.md                    # Local repository guidelines
+├── plan.md                      # Current task record, while a task is open
+├── src/
+│   └── ym_playlist_maker/
+│       ├── __init__.py           # Package initialization
+│       ├── __main__.py           # auth and bot CLI entry points
+│       ├── bot.py                # Telegram commands, messages, and inline buttons
+│       ├── config.py             # Environment configuration and data directory
+│       ├── models.py             # Draft, track, and search candidate models
+│       ├── parser.py             # Track list parsing and normalized exact matching
+│       ├── search.py             # YouTube Music search adapter
+│       ├── service.py            # Playlist workflow and recovery rules
+│       ├── store.py              # SQLite draft persistence
+│       └── youtube.py            # Google OAuth and YouTube Data API adapter
+├── tests/
+│   ├── test_auth.py              # OAuth configuration, callback, and token storage
+│   ├── test_boundaries.py        # API requests and Telegram interaction boundaries
+│   ├── test_parser.py            # Input parsing and matching rules
+│   └── test_workflow.py          # State transitions, retries, and write reconciliation
+├── docs/
+│   └── archive_tasks/            # Local records of project tasks
+└── data/                        # Docker runtime token and SQLite state
+```
+
+`AGENTS.md`, `plan.md`, and `docs/` are local working records excluded from Git. The runtime `data/` directory is also excluded from Git and the Docker build context. Local execution defaults to `%LOCALAPPDATA%\ym_playlist_maker`; `YM_DATA_DIR` overrides the runtime location. OAuth client files are supplied separately from a private location.
+
+## Technical Stack
+
+The dependency ranges below are declared in `pyproject.toml`; the Docker image uses Python 3.12.
+
+| Area               | Technology                 | Version or configuration                                                 |
+|--------------------|----------------------------|--------------------------------------------------------------------------|
+| Runtime            | Python                     | `>=3.12`                                                                 |
+| Telegram interface | `python-telegram-bot`      | `>=22.0,<23`; asynchronous handlers and long polling                     |
+| Music search       | `ytmusicapi`               | `>=1.10,<2`; unauthenticated YouTube Music song search                   |
+| Playlist API       | `google-api-python-client` | `>=2.0,<3`; YouTube Data API v3                                          |
+| Authorization      | `google-auth-oauthlib`     | `>=1.3,<2`; Google OAuth Desktop app flow and locally stored credentials |
+| Persistence        | SQLite and JSON            | Python standard library `sqlite3` and `json`                             |
+| Concurrency        | `asyncio`                  | Python standard library; serialized actions and worker threads           |
+| Packaging          | setuptools and pip         | `setuptools>=70`; `src/` package layout and editable installation        |
+| Testing            | pytest                     | `>=8,<10`; optional `test` dependency group                              |
+| Deployment         | Docker and Docker Compose  | `python:3.12-slim`; one bot service with a persistent data bind mount    |
 
 ## Setup
 
