@@ -234,3 +234,17 @@ def resolve_candidates(
         return decision("different_durations")
     return decision("auto_equivalent_releases", compatible[0].video_id)
 
+
+
+def eligible_candidates(track: Track, candidates: Sequence[Candidate]) -> tuple[str, ...]:
+    """Allow release preferences, but never delegate song/version identity."""
+    request = _title_recording(track.title)
+    if request.unknown:
+        return ()
+    artist = normalized(track.artist)
+    return tuple(dict.fromkeys(
+        c.video_id for c in candidates
+        if (recording := _candidate_recording(c)).base == request.base
+        and not recording.unknown and _compatible(request, recording)
+        and artist in {normalized(a) for a in c.artists}
+    ))

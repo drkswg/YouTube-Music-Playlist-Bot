@@ -37,7 +37,7 @@ The workflow follows a persisted sequence: `resolving` → `title` → `confirm`
 4. **Create and populate the playlist.** Create a private playlist, save its ID, and insert selected recordings in input order. Repeated video IDs are skipped. Before the first insertion attempt, wait for playlist availability and retry only `404 playlistNotFound` reads, up to three attempts.
 5. **Recover through reconciliation.** Persist creation and insertion attempts before sending writes. On `/resume`, identify an uncertain playlist creation by its draft marker and compare remote playlist contents with the expected track order before continuing. An absent track after an uncertain insertion requires an explicit retry after the owner checks the playlist; unexpected external changes stop writing.
 
-The application keeps one active draft, validates buttons against draft IDs and search or insertion revisions, and allows cancellation before creation starts. Automated tests use fake external services and temporary storage so that workflow recovery can be checked without network access or credentials.
+The application keeps one active draft, validates buttons against draft IDs and search or insertion revisions, and allows cancellation before creation starts. With an optional Gemini key, fresh ambiguous searches are delegated to Gemini after local identity/version filtering; persisted decisions are never repeated after a restart. Automated tests use fake external services and temporary storage so that workflow recovery can be checked without network access or credentials.
 
 ## Folder Structure
 
@@ -122,6 +122,29 @@ The dependency ranges below are declared in `pyproject.toml`; the Docker image u
 
    Search metadata cannot prove that two recordings sound identical. Version detection uses terminal title qualifiers and explicit album labels; ordinary names such as "Live Forever" and "Live Through This" are preserved. Unlabelled alternate takes, remasters, or edits may still be indistinguishable. The two-second duration rule is a conservative metadata heuristic, not an audio comparison. Check the selected recordings in the final review and verify real search behaviour with the integration procedure below.
 
+## Optional Gemini Free Tier Selection
+
+Leave `GEMINI_API_KEY` empty to retain the existing deterministic/manual workflow. To reduce manual questions, create a **separate Gemini project with Cloud Billing disabled** in [Google AI Studio](https://aistudio.google.com/apikey), generate its API key, and set `GEMINI_API_KEY` in your local process environment or Docker `.env`. Do not use a key from a project with billing enabled. The fixed model is `gemini-3.5-flash-lite`; no paid fallback, alternate model, tools, grounding, or automatic retries are used. The fixed request uses minimal thinking, does not request thought summaries, and allows 512 output tokens for the short structured decision. Gemini 2.5 Flash-Lite can return HTTP 404 for newly created projects because access is restricted to prior users; this bot uses the recommended Gemini 3.5 Flash-Lite primary model instead. See the official [model documentation](https://ai.google.dev/gemini-api/docs/models) and [Free tier pricing](https://ai.google.dev/gemini-api/docs/pricing). The client cannot verify the project's billing status. Free tier availability, regional access, and quotas remain subject to Google's terms; confirm eligibility in AI Studio. See [pricing](https://ai.google.dev/gemini-api/docs/pricing) and [billing](https://ai.google.dev/gemini-api/docs/billing).
+
+```powershell
+$env:GEMINI_API_KEY = "your-separate-free-project-key"
+.\.venv\Scripts\python.exe -m ym_playlist_maker bot
+```
+
+Gemini receives only the requested artist/title and search metadata (titles, artists, albums, durations, eligibility labels, and the local reason for ambiguity). It receives no Telegram identity, playlist title, OAuth credentials, or YouTube video IDs. Metadata sent to a free service is governed by its [terms](https://ai.google.dev/gemini-api/terms); check those before using it.
+
+Confident local matches are still selected immediately. For a fresh ambiguous ordinary search, local rules require an exact normalized base title and the requested artist; unknown or incompatible versions are excluded individually. Requested live venues, remix names and years are preserved. An ordinary request cannot switch to labelled live, remix, remastered, rerecorded, clean, explicit or other alternate versions. Gemini may choose among eligible releases with different durations or extra artist credits, including candidates beyond the five displayed manual options. It may also abstain. Model output is validated against the exact saved search snapshot; invalid responses, safety blocks, timeouts, quota limits, or API errors fall back to manual choice.
+
+Failed automatic selection produces a safe warning in the bot logs, for example `Gemini selection failed: model=gemini-3.5-flash-lite source_line=3 error_code=http_429 error_detail=resource_exhausted`. Logs include only the fixed model, source line number and allowlisted machine categories; they do not include keys, provider message text, request/response bodies, artist names or song titles. Telegram distinguishes authentication/access errors, free quota limits, connectivity/timeouts, blocked or truncated responses, and interrupted attempts. HTTP 400 can mean an invalid key or request configuration; an allowlisted `api_key_invalid` detail identifies the former. Check the project/key configuration and AI Studio limits for the reported category; billing is never enabled by the bot.
+
+Fixing configuration does not resend an existing snapshot: `/resume`, custom search and `/edit` preserve manual handling. To try Gemini again after fixing the cause, cancel the draft before creation and send a **fresh song list**. Quota failures have no automatic sleeps or retries.
+
+The search snapshot and an attempted-call record are saved before dispatch. Each fresh ambiguous track gets at most one request, with a 10-second socket timeout and bounded request/response sizes. An interrupted request, existing legacy search, custom search, or reopened review is manual on `/resume`; there is no cross-draft cache. Calls are processed serially and progress is sent before each one, so processing many ambiguous songs can take cumulative time. The socket timeout is not a total playlist processing deadline. `/cancel` waits for the current serialized handler to finish.
+
+Check the final review carefully: metadata and a model cannot establish audio identity. Use `/edit <source line number>` before creation to reopen the saved options for any selected or skipped song. The original playlist title and track order are retained, the edit is manual, and old creation buttons are invalidated. Custom search and skip remain available. After your choice, the bot returns to review. Editing is unavailable once creation or insertion starts; after a definitive creation rejection such as HTTP 429, retrying creation and editing remain available.
+
+For Docker, add the key to `.env` and run `docker compose up --build -d` to include this code and optional environment configuration. Do not share `docker compose config` output: it can expose both API keys and the Telegram token. For local runs, restart the bot after setting the variable. Validate the integration with a few real ambiguous searches, check the versions, use `/edit`, and then create a private playlist; offline tests cannot verify project billing, actual Gemini availability, model quality, or real Telegram delivery.
+
 ## Running with Docker Compose
 
 Install Docker with Compose. Complete OAuth authorization once on the Windows host: it opens a browser and uses a temporary local port. From the project directory in PowerShell:
@@ -143,7 +166,7 @@ docker compose up --build -d
 docker compose logs -f bot
 ```
 
-After authorization, `data/token.json` is available to the container through a bind mount; `state.sqlite3` is saved in the same directory. The `data/` directory and `.env` file are excluded from Git and the image build context. Restrict access to yourself and do not publish the output of `docker compose config`, which exposes the Telegram token. No ports need to be exposed: the bot receives messages through long polling.
+After authorization, `data/token.json` is available to the container through a bind mount; `state.sqlite3` is saved in the same directory. The `data/` directory and `.env` file are excluded from Git and the image build context. Restrict access to yourself and do not publish the output of `docker compose config`, which exposes configured API keys and the Telegram token. No ports need to be exposed: the bot receives messages through long polling.
 
 If the bot has already run locally, stop the local process and copy `%LOCALAPPDATA%\ym_playlist_maker\token.json` to `data/token.json` instead of running `auth` again. If there is an unfinished draft, also move `state.sqlite3` to `data/`.
 

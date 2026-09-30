@@ -4,6 +4,7 @@ services:
     environment:
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:?Set TELEGRAM_BOT_TOKEN in .env}
       TELEGRAM_OWNER_ID: ${TELEGRAM_OWNER_ID:?Set TELEGRAM_OWNER_ID in .env}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
       YM_DATA_DIR: /app/data
     volumes:
       - type: bind

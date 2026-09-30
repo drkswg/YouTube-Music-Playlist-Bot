@@ -18,6 +18,20 @@ class Candidate:
 
 
 @dataclass
+class SelectionRecord:
+    provider: str
+    model: str
+    policy: str
+    snapshot_hash: str
+    search_revision: int
+    status: Literal["attempted", "selected", "abstained", "failed"] = "attempted"
+    selected_id: str | None = None
+    reason: str | None = None
+    error_code: str | None = None
+    error_detail: str | None = None
+
+
+@dataclass
 class Track:
     artist: str
     title: str
@@ -29,10 +43,13 @@ class Track:
     search_revision: int = 0
     insert_revision: int = 0
     await_query: bool = False
+    selection_record: SelectionRecord | None = None
 
     @classmethod
     def from_dict(cls, value: dict) -> "Track":
         value = value.copy()
+        if value.get("selection_record") is not None:
+            value["selection_record"] = SelectionRecord(**value["selection_record"])
         value["candidates"] = [Candidate.from_dict(x) for x in value.get("candidates", [])]
         return cls(**value)
 
@@ -46,6 +63,7 @@ class Draft:
     playlist_id: str | None = None
     create_marker: str = ""
     errors: list[str] = field(default_factory=list)
+    review_revision: int = 0
 
     def to_dict(self) -> dict:
         return asdict(self)

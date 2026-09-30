@@ -8,7 +8,7 @@ from telegram.constants import ChatType
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
 from .config import BotConfig
-from .models import Draft, selected_candidate
+from .models import Draft, SelectionRecord, selected_candidate
 from .parser import resolve_candidates
 from .service import PlaylistWorkflow, UnconfirmedInsert, WorkflowError
 
@@ -26,6 +26,37 @@ _RESOLUTION_MESSAGES = {
     "different_durations": "Matching releases have different durations and may be different recordings. Please choose one.",
     "custom_search": "Please choose a recording from your search results.",
 }
+
+
+def selection_fallback_message(record: SelectionRecord) -> str:
+    """Describe only safe categories, never provider messages or arbitrary codes."""
+    if record.status == "attempted":
+        return "Automatic selection was interrupted. The saved search will not be sent again. Please choose manually."
+    if record.status == "abstained":
+        return "Gemini could not choose confidently. Please choose manually."
+    details = {
+        "api_key_invalid": "Gemini rejected the API key. Check GEMINI_API_KEY.",
+        "service_disabled": "Gemini API is disabled for this project. Check the project configuration.",
+        "api_key_service_blocked": "The API key does not allow Gemini. Check its API restrictions.",
+        "api_key_ip_address_blocked": "The API key blocks this connection. Check its IP restrictions.",
+        "timeout": "Gemini did not respond within the connection timeout.",
+        "max_tokens": "Gemini's response was truncated before completing a decision.",
+        "safety": "Gemini blocked this decision through its safety checks.",
+        "blocked": "Gemini blocked this decision through its content checks.",
+    }
+    categories = {
+        "http_400": "Gemini rejected the request. Check the API key and project configuration.",
+        "http_401": "Gemini authentication failed. Check GEMINI_API_KEY.",
+        "http_403": "Gemini access is denied. Check project access, API restrictions and regional availability.",
+        "http_404": "The configured Gemini model or endpoint is unavailable for this project.",
+        "http_429": "Gemini's free quota or request limit has been reached. Check AI Studio limits.",
+        "transport_error": "Gemini could not be reached due to a network or connection error.",
+        "invalid_response": "Gemini returned an invalid or incomplete decision.",
+        "request_too_large": "The search metadata exceeds the automatic selection request limit.",
+        "response_too_large": "Gemini's response exceeds the automatic selection response limit.",
+    }
+    text = details.get(record.error_detail) or categories.get(record.error_code)
+    return (text or "Automatic selection is unavailable.") + " Please choose manually."
 
 
 class BotUI:
@@ -46,7 +77,7 @@ class BotUI:
         if self.allowed(update):
             await update.effective_message.reply_text(
                 "Send a list with one song per line, for example Oasis — Wonderwall. "
-                "Commands: /resume, /cancel."
+                "Commands: /resume, /cancel, /edit <source line>."
             )
 
     async def cancel(self, update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -56,6 +87,18 @@ class BotUI:
             try:
                 await asyncio.to_thread(self.workflow.cancel)
                 await update.effective_message.reply_text("Draft cancelled.")
+            except Exception as exc:
+                await self._error(update, exc)
+
+    async def edit(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self.allowed(update):
+            return
+        async with self.lock:
+            try:
+                if len(context.args) != 1 or not context.args[0].isdecimal():
+                    raise WorkflowError("Use /edit <source line number> from the review")
+                await asyncio.to_thread(self.workflow.edit, int(context.args[0]))
+                await self._show_state(update)
             except Exception as exc:
                 await self._error(update, exc)
 
@@ -128,8 +171,11 @@ class BotUI:
                     await asyncio.to_thread(self.workflow.request_search_again, int(parts[3]), int(parts[4]))
                     await update.effective_message.reply_text("Send a new search query for this song.")
                     return
-                elif action == "create" and len(parts) == 3:
-                    draft = await self._publish(update)
+                elif action == "create" and len(parts) in (3, 4):
+                    expected = int(parts[3]) if len(parts) == 4 else 0
+                    if draft.phase != "confirm" or draft.review_revision != expected:
+                        raise WorkflowError("This review is outdated; use /resume")
+                    draft = await self._publish(update, expected_review_revision=expected if len(parts) == 4 else None)
                     await self._done(update, draft)
                     return
                 elif action == "retryinsert" and len(parts) == 5:
@@ -148,7 +194,7 @@ class BotUI:
             except Exception as exc:
                 await self._error(update, exc)
 
-    async def _publish(self, update: Update) -> Draft:
+    async def _publish(self, update: Update, *, expected_review_revision: int | None = None) -> Draft:
         loop = asyncio.get_running_loop()
 
         def on_playlist_pending() -> None:
@@ -165,10 +211,34 @@ class BotUI:
                     notification.close()
                 log.warning("Could not send playlist creation progress", exc_info=True)
 
-        return await asyncio.to_thread(self.workflow.publish, on_playlist_pending=on_playlist_pending)
+        kwargs = {"on_playlist_pending": on_playlist_pending}
+        if expected_review_revision is not None:
+            kwargs["expected_review_revision"] = expected_review_revision
+        return await asyncio.to_thread(self.workflow.publish, **kwargs)
 
     async def _show_state(self, update: Update) -> None:
-        draft, index = await asyncio.to_thread(self.workflow.next_unresolved)
+        kwargs = {}
+        if getattr(self.workflow, "selector", None) is not None:
+            loop = asyncio.get_running_loop()
+
+            def progress(line: int, total: int) -> None:
+                notification = None
+                future = None
+                try:
+                    notification = update.effective_message.reply_text(
+                        f"Gemini is choosing a recording for source line {line} ({total} songs). Please wait."
+                    )
+                    future = asyncio.run_coroutine_threadsafe(notification, loop)
+                    future.result(timeout=10)
+                except Exception:
+                    if future is not None:
+                        future.cancel()
+                    elif notification is not None:
+                        notification.close()
+                    log.warning("Could not send recording selection progress")
+
+            kwargs["on_selection_pending"] = progress
+        draft, index = await asyncio.to_thread(self.workflow.next_unresolved, **kwargs)
         if draft.phase == "resolving" and index is not None:
             track = draft.tracks[index]
             if track.await_query:
@@ -195,6 +265,8 @@ class BotUI:
                 is_custom=track.search_query != f"{track.artist} {track.title}",
             )
             text += "\n" + _RESOLUTION_MESSAGES.get(decision.reason, "Please confirm a recording from the saved search results.")
+            if track.selection_record:
+                text += "\n" + selection_fallback_message(track.selection_record)
             if track.candidates:
                 for i, candidate in enumerate(track.candidates[:5], start=1):
                     album = f" · album: {candidate.album}" if candidate.album else ""
@@ -228,10 +300,10 @@ class BotUI:
             await self._send_lines(update, [f"{draft.title}: selected recordings"] + lines)
             base = f"d:{draft.draft_id}:"
             rows = [[
-                InlineKeyboardButton("Create private playlist", callback_data=base + "create"),
+                InlineKeyboardButton("Create private playlist", callback_data=base + f"create:{draft.review_revision}"),
                 InlineKeyboardButton("Cancel", callback_data=base + "cancel"),
             ]]
-            summary = f"Reviewed {len(selected)} selected entries. Create a private playlist?"
+            summary = f"Reviewed {len(selected)} selected entries. Use /edit <source line> to change a recording. Create a private playlist?"
             await update.effective_message.reply_text(summary, reply_markup=InlineKeyboardMarkup(rows))
         elif draft.phase == "done":
             await self._done(update, draft)
@@ -283,6 +355,7 @@ def build_application(config: BotConfig, workflow: PlaylistWorkflow) -> Applicat
     app.add_handler(CommandHandler("start", ui.start))
     app.add_handler(CommandHandler("cancel", ui.cancel))
     app.add_handler(CommandHandler("resume", ui.resume))
+    app.add_handler(CommandHandler("edit", ui.edit))
     app.add_handler(CallbackQueryHandler(ui.callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, ui.text))
     return app

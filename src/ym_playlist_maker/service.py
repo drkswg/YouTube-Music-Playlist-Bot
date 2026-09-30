@@ -1,15 +1,21 @@
 """Synchronous, serialized draft workflow. The Telegram layer runs this in a worker thread."""
 
+import logging
+
 from collections.abc import Callable
 from time import sleep
 from uuid import uuid4
 
 from googleapiclient.errors import HttpError
 
-from .models import Draft, Track
-from .parser import parse_tracks, resolve_candidates
+from .models import Draft, Track, SelectionRecord
+from .parser import parse_tracks, resolve_candidates, eligible_candidates
+from .selection import MODEL, POLICY, SelectionInput, SelectionError, Selector
 from .store import DraftStore
 from .youtube import BeforeInsertError, http_error_reason
+
+
+log = logging.getLogger(__name__)
 
 
 class WorkflowError(RuntimeError):
@@ -28,10 +34,11 @@ class UnconfirmedInsert(UncertainWrite):
 
 
 class PlaylistWorkflow:
-    def __init__(self, store: DraftStore, search, youtube) -> None:
+    def __init__(self, store: DraftStore, search, youtube, selector: Selector | None = None) -> None:
         self.store = store
         self.search = search
         self.youtube = youtube
+        self.selector = selector
 
     def active(self) -> Draft | None:
         return self.store.load()
@@ -49,19 +56,24 @@ class PlaylistWorkflow:
         self.store.save(draft)
         return draft, []
 
-    def next_unresolved(self) -> tuple[Draft, int | None]:
+    def next_unresolved(self, *, on_selection_pending: Callable[[int, int], None] | None = None) -> tuple[Draft, int | None]:
         draft = self._require()
         if draft.phase != "resolving":
             return draft, None
-        for index, track in enumerate(draft.tracks):
+        for index in range(len(draft.tracks)):
+            track = draft.tracks[index]
             if track.status != "pending":
                 continue
-            if not track.search_query:
-                self._search_into(draft, track, f"{track.artist} {track.title}")
+            if (not track.search_query and not track.candidates and track.search_revision == 0
+                and track.selection_record is None):
+                self._search_into(draft, track, f"{track.artist} {track.title}", on_selection_pending=on_selection_pending)
+                track = draft.tracks[index]
             if track.status != "pending":
                 continue
             return draft, index
-        draft.phase = "title"
+        if draft.title and not any(t.status == "selected" for t in draft.tracks):
+            raise WorkflowError("All songs have been skipped; use /cancel")
+        draft.phase = "confirm" if draft.title else "title"
         self.store.save(draft)
         return draft, None
 
@@ -98,6 +110,27 @@ class PlaylistWorkflow:
         draft = self._require()
         track = self._pending_at(draft, index, revision)
         track.status = "skipped"
+        self.store.save(draft)
+        return draft
+
+    def edit(self, source_line: int) -> Draft:
+        draft = self._require()
+        if draft.phase != "confirm" or draft.playlist_id or any(
+            t.insert_revision or t.status in ("added", "uncertain") for t in draft.tracks
+        ):
+            raise WorkflowError("Editing is available only before playlist creation")
+        track = next((t for t in draft.tracks if t.source_line == source_line), None)
+        if track is None:
+            raise WorkflowError("No song on that source line")
+        track.selected = None
+        track.status = "pending"
+        track.selection_record = None
+        track.await_query = False
+        # A reopened snapshot is manual, including a legacy empty search query.
+        track.search_query = track.search_query or f"{track.artist} {track.title}"
+        track.search_revision += 1
+        draft.review_revision += 1
+        draft.phase = "resolving"
         self.store.save(draft)
         return draft
 
@@ -144,11 +177,18 @@ class PlaylistWorkflow:
         self.store.save(draft)  # Persist the owner's approval before another write attempt.
         return self._write_tracks(draft)
 
-    def publish(self, *, on_playlist_pending: Callable[[], None] | None = None) -> Draft:
+    def publish(self, *, on_playlist_pending: Callable[[], None] | None = None,
+                expected_review_revision: int | None = None) -> Draft:
         draft = self._require()
+        if expected_review_revision is not None and (
+            draft.phase != "confirm" or draft.review_revision != expected_review_revision
+        ):
+            raise WorkflowError("This review is outdated; use /resume")
         if draft.phase == "done":
             return draft
         if draft.phase == "confirm":
+            if not any(t.status == "selected" and t.selected for t in draft.tracks):
+                raise WorkflowError("All songs have been skipped; use /cancel")
             # Fail before entering the uncertain creation phase when credentials are missing.
             self.youtube.check_credentials()
             draft.phase = "creating"
@@ -253,16 +293,71 @@ class PlaylistWorkflow:
         self.store.save(draft)
         return draft
 
-    def _search_into(self, draft: Draft, track: Track, query: str, *, is_custom: bool = False) -> None:
+    def _search_into(self, draft: Draft, track: Track, query: str, *, is_custom: bool = False,
+                     on_selection_pending: Callable[[int, int], None] | None = None) -> None:
         candidates = self.search.songs(query)
         decision = resolve_candidates(track, candidates, is_custom=is_custom)
         track.candidates = list(decision.ordered_candidates)
         track.search_query = query
         track.search_revision += 1
+        track.selection_record = None
         if decision.selected_video_id is not None:
             track.selected = decision.selected_video_id
             track.status = "selected"
-        self.store.save(draft)
+        self.store.save(draft)  # Persist the exact fresh snapshot before any model call.
+        eligible = eligible_candidates(track, track.candidates)
+        if is_custom or self.selector is None or track.status != "pending" or not eligible:
+            return
+        value = SelectionInput.from_track(track, eligible, decision.reason)
+        record = SelectionRecord("gemini", MODEL, POLICY, value.snapshot_hash(), track.search_revision)
+        track.selection_record = record
+        self.store.save(draft)  # An interrupted attempted call remains manual on resume.
+        if on_selection_pending is not None:
+            try:
+                on_selection_pending(track.source_line, len(draft.tracks))
+            except Exception:
+                pass  # Telegram delivery cannot change the recording decision.
+        try:
+            result = self.selector.select(value)
+            if (result.selected_id is not None and result.selected_id not in eligible) or (
+                result.reason not in ("preferred_release", "requested_version", "insufficient_evidence")
+            ) or ((result.selected_id is None) != (result.reason == "insufficient_evidence")):
+                raise SelectionError("invalid_response")
+        except SelectionError as exc:
+            result = None
+            error_code = exc.code
+            error_detail = exc.detail
+        except Exception:
+            result = None
+            error_code = "selector_error"
+            error_detail = None
+        current = self.active()
+        index = draft.tracks.index(track)
+        if current is None or current.draft_id != draft.draft_id or current.phase != "resolving":
+            raise WorkflowError("The draft changed during selection; use /resume")
+        latest = current.tracks[index]
+        if (latest.status != "pending" or latest.await_query or latest.search_revision != record.search_revision
+            or latest.selection_record != record
+            or SelectionInput.from_track(latest, eligible_candidates(latest, latest.candidates), decision.reason).snapshot_hash()
+               != record.snapshot_hash):
+            raise WorkflowError("The search changed during selection; use /resume")
+        if result is None:
+            record.status = "failed"
+            record.error_code = error_code
+            record.error_detail = error_detail
+            log.warning("Gemini selection failed: model=%s source_line=%s error_code=%s error_detail=%s",
+                        MODEL, latest.source_line, error_code, error_detail or "none")
+        else:
+            record.status = "selected" if result.selected_id else "abstained"
+            record.selected_id = result.selected_id
+            record.reason = result.reason
+            if result.selected_id:
+                latest.selected = result.selected_id
+                latest.status = "selected"
+        latest.selection_record = record
+        self.store.save(current)
+        # Continue the same resolution loop using the reloaded, validated state.
+        draft.__dict__.update(current.__dict__)
 
     def _require(self) -> Draft:
         draft = self.active()

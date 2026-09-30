@@ -25,6 +25,7 @@ def main() -> None:
         return
     from .bot import build_application
     from .search import MusicSearch
+    from .selection import GeminiSelector
     from .service import PlaylistWorkflow
     from .store import DraftStore
     from telegram import Update
@@ -32,7 +33,8 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     config = bot_config()
     store = DraftStore(config.directory / "state.sqlite3")
-    workflow = PlaylistWorkflow(store, MusicSearch(), YouTubePlaylists(config.directory / "token.json"))
+    workflow = PlaylistWorkflow(store, MusicSearch(), YouTubePlaylists(config.directory / "token.json"),
+                                GeminiSelector(config.gemini_api_key) if config.gemini_api_key else None)
     build_application(config, workflow).run_polling(allowed_updates=Update.ALL_TYPES)
 
 
