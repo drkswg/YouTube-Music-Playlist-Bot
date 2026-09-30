@@ -2,6 +2,7 @@
 import asyncio
 import io
 import json
+import logging
 import threading
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,7 +15,7 @@ from ym_playlist_maker import selection
 from ym_playlist_maker.bot import BotUI
 from ym_playlist_maker.config import BotConfig, bot_config
 from ym_playlist_maker.models import Candidate, Draft, Track
-from ym_playlist_maker.parser import eligible_candidates
+from ym_playlist_maker.parser import eligible_candidates, resolve_candidates
 from ym_playlist_maker.selection import GeminiSelector, SelectionDecision, SelectionError, SelectionInput
 from ym_playlist_maker.service import PlaylistWorkflow, WorkflowError
 from ym_playlist_maker.store import DraftStore
@@ -111,6 +112,50 @@ def test_eligibility_excludes_unknown_and_incompatible_individually():
         assert eligible_candidates(request, [Candidate("yes", request.title, ["Artist"]), cs[0]]) == ("yes",)
 
 
+def test_eligibility_accepts_featured_and_literal_titles_without_accepting_other_versions():
+    request = Track("Rihanna", "Only Girl (In the World)", 1)
+    cs = [Candidate("studio", "Only Girl (In The World) (feat. Guest)", ["Rihanna"]),
+          Candidate("remix", "Only Girl (In The World) (Remix) (feat. Guest)", ["Rihanna"]),
+          Candidate("other", "Only Girl", ["Rihanna"])]
+    assert eligible_candidates(request, cs) == ("studio",)
+    requested_guest = Track("Artist", "Song (feat. Guest One)", 1)
+    assert eligible_candidates(requested_guest, [
+        Candidate("right", "Song (ft. Guest One)", ["Artist"]),
+        Candidate("wrong", "Song (feat. Guest Two)", ["Artist"]),
+    ]) == ("right",)
+
+
+def test_gemini_can_check_abbreviated_titles_without_bypassing_version_or_artist_rules():
+    request = Track("Artist", "Song", 1)
+    cs = [Candidate("subtitle", "Song (Another Story) (feat. Guest)", ["Artist"]),
+          Candidate("demo", "Song (Demo)", ["Artist"]),
+          Candidate("live", "Song (Another Story) (Live)", ["Artist"]),
+          Candidate("remix", "Song (Another Story) (Remix)", ["Artist"]),
+          Candidate("other", "Song (Another Story)", ["Other"]),
+          Candidate("different", "Different Song (Another Story)", ["Artist"])]
+    assert eligible_candidates(request, cs) == ("subtitle",)
+    specific = Track("Artist", "Song (Another Story)", 1)
+    assert not eligible_candidates(specific, [Candidate("short", "Song", ["Artist"])])
+
+
+def test_multiple_literal_subtitles_can_be_checked_by_gemini():
+    request = Track("Shakira", "Waka Waka", 1)
+    full = 'Waka Waka (This Time for Africa) [The Official 2010 FIFA World Cup (TM) Song] (feat. Freshlyground)'
+    assert eligible_candidates(request, [Candidate("studio", full, ["Shakira"])]) == ("studio",)
+
+
+@pytest.mark.parametrize("requested,credited", [
+    ("Black Eyed Peas", "The Black Eyed Peas"), ("The Black Eyed Peas", "Black Eyed Peas"),
+])
+def test_leading_artist_article_is_checked_by_gemini_without_local_guess(requested, credited):
+    request = Track(requested, "Song", 1)
+    cs = [Candidate("correct", "Song", [credited]),
+          Candidate("cover", "Song", ["Other"]),
+          Candidate("live", "Song (Live)", [credited])]
+    assert resolve_candidates(request, cs).selected_video_id is None
+    assert eligible_candidates(request, cs) == ("correct",)
+
+
 @pytest.fixture
 def workflow(tmp_path):
     store = DraftStore(tmp_path / "state.sqlite3")
@@ -119,6 +164,79 @@ def workflow(tmp_path):
     flow.start("\nArtist — Song\nArtist — Song")
     yield flow
     store.close()
+
+
+def test_featured_studio_result_is_chosen_without_model_or_manual_prompt(workflow):
+    workflow.search.songs = lambda query: [
+        Candidate("remix", "Song (Remix) (feat. Guest)", ["Artist"]),
+        Candidate("studio", "Song (feat. Guest)", ["Artist"]),
+        Candidate("unclear", "Song (Special Version)", ["Artist"]),
+    ]
+    workflow.selector.select = lambda value: pytest.fail("clean studio match should not call Gemini")
+    draft, index = workflow.next_unresolved()
+    assert index is None and draft.phase == "title"
+    assert [t.selected for t in draft.tracks] == ["studio", "studio"]
+    assert all(t.selection_record is None for t in draft.tracks)
+
+
+def test_ambiguous_featured_releases_reach_gemini_with_alternates_excluded(workflow):
+    workflow.search.songs = lambda query: [
+        Candidate("unknown", "Song (Demo)", ["Artist"]),
+        Candidate("first", "Song (feat. Guest)", ["Artist"], "Album", "3:42"),
+        Candidate("second", "Song (feat. Guest)", ["Artist"], "Compilation", "3:48"),
+        Candidate("live", "Song (Live) (feat. Guest)", ["Artist"]),
+    ]
+    calls = []
+    def select(value):
+        calls.append(value)
+        assert value.eligible_ids == ("first", "second")
+        assert value.rules_reason == "different_durations"
+        return SelectionDecision("first", "preferred_release")
+    workflow.selector.select = select
+    draft, index = workflow.next_unresolved()
+    assert index is None and len(calls) == 2
+    assert all(t.selected == "first" and t.selection_record.status == "selected" for t in draft.tracks)
+
+
+def test_abbreviated_title_is_decided_by_gemini_and_not_guessed_locally(workflow):
+    workflow.search.songs = lambda query: [
+        Candidate("subtitle", "Song (Another Story)", ["Artist"]),
+        Candidate("live", "Song (Live)", ["Artist"]),
+    ]
+    calls = []
+    def select(value):
+        calls.append(value)
+        assert value.eligible_ids == ("subtitle",)
+        return SelectionDecision("subtitle", "preferred_release")
+    workflow.selector.select = select
+    draft, index = workflow.next_unresolved()
+    assert index is None and len(calls) == 2
+    assert all(t.selection_record.status == "selected" for t in draft.tracks)
+
+
+@pytest.mark.parametrize("title,reason", [
+    ("Song (Demo)", "unsupported_qualifier"), ("Song (Live)", "version_unavailable"),
+    ("Different Song", "no_confident_match"),
+])
+def test_no_eligible_results_are_manual_and_log_why_gemini_was_not_called(workflow, caplog, title, reason):
+    caplog.set_level(logging.INFO, logger="ym_playlist_maker.service")
+    workflow.search.songs = lambda query: [Candidate("id", title, ["Artist"])]
+    workflow.selector.select = lambda value: pytest.fail("no eligible result")
+    draft, index = workflow.next_unresolved()
+    assert index == 0 and draft.tracks[0].selection_record is None
+    assert "source_line=2" in caplog.text and f"rules_reason={reason}" in caplog.text
+    assert "gemini_status=no_eligible_candidates" in caplog.text
+    assert "candidates=1 eligible=0" in caplog.text
+    assert title not in caplog.text and "Artist" not in caplog.text
+
+
+def test_model_abstention_logs_a_manual_decision_without_provider_failure(workflow, caplog):
+    caplog.set_level(logging.INFO, logger="ym_playlist_maker.service")
+    workflow.selector.select = lambda value: SelectionDecision(None, "insufficient_evidence")
+    draft, index = workflow.next_unresolved()
+    assert index == 0 and draft.tracks[0].selection_record.status == "abstained"
+    assert "gemini_status=abstained" in caplog.text
+    assert "Gemini selection failed" not in caplog.text
 
 
 def test_attempt_is_persisted_before_dispatch_and_selected_results_survive_restart(workflow):

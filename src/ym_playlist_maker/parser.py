@@ -73,6 +73,11 @@ _MARKERS = (
 )
 _TERMINAL = re.compile(r"^(.*?)\s*(?:\(([^()]*)\)|\[([^\[\]]*)\])\s*$")
 _SUFFIX = re.compile(r"^(.*?)\s+[—–-]\s+(.+)$")
+_FEATURE_CREDIT = re.compile(r"^(?:feat\.?|ft\.?|featuring)\s+(?=\S)", re.I)
+_VERSION_HINT = re.compile(
+    r"\b(?:version|recording|edition|demo|take|radio|mono|stereo|"
+    r"slowed|sped|speed|bonus|anniversary)\b"
+)
 
 
 @dataclass(frozen=True)
@@ -81,6 +86,20 @@ class _Recording:
     versions: tuple[tuple[str, str], ...] = ()
     unknown: bool = False
     explicit_studio: bool = False
+    featured: tuple[str, ...] = ()
+    subtitle_bases: tuple[str, ...] = ()
+
+
+def _subtitle_bases(title: str) -> tuple[str, ...]:
+    """Offer literal parenthetical title expansions to Gemini, never local auto."""
+    bases: list[str] = []
+    while (match := _TERMINAL.match(title)) and match.group(1).strip():
+        qualifier = next(g for g in match.groups()[1:] if g is not None)
+        if _version(qualifier) or _VERSION_HINT.search(normalized(qualifier)):
+            break
+        title = match.group(1).strip()
+        bases.append(normalized(title))
+    return tuple(bases)
 
 
 def _version(qualifier: str) -> tuple[tuple[str, str], ...]:
@@ -101,15 +120,30 @@ def _title_recording(title: str) -> _Recording:
     versions: list[tuple[str, str]] = []
     unknown = False
     explicit_studio = False
+    featured: list[str] = []
     while True:
         match = _TERMINAL.match(base) or _SUFFIX.match(base)
         if not match or not match.group(1).strip():
             break
         qualifier = next(g for g in match.groups()[1:] if g is not None)
+        feature = _FEATURE_CREDIT.match(qualifier.strip())
+        if feature:
+            # Featuring credits describe collaborators, not a recording version.
+            featured.append(normalized(qualifier.strip()[feature.end():]))
+            base = match.group(1).strip()
+            continue
         markers = _version(qualifier)
-        if normalized(qualifier) in ("original", "original version"):
+        label = normalized(qualifier)
+        if label in ("original", "original version", "studio", "studio version") or re.fullmatch(
+            r"studio recording(?: from .+ performance)?", label
+        ):
             explicit_studio = True
+            markers = ()
         elif not markers:
+            if not _VERSION_HINT.search(normalized(qualifier)):
+                # A literal subtitle, e.g. "Only Girl (In the World)", stays
+                # part of the song identity. Never drop arbitrary title words.
+                break
             unknown = True
         versions.extend(markers)
         base = match.group(1).strip()
@@ -123,7 +157,8 @@ def _title_recording(title: str) -> _Recording:
     # contradictory, whether it appears in the input or search metadata.
     if len({kind for kind, _ in versions}) != len(versions) or (explicit_studio and versions):
         unknown = True
-    return _Recording(normalized(base), tuple(versions), unknown, explicit_studio)
+    return _Recording(normalized(base), tuple(versions), unknown, explicit_studio,
+                      tuple(sorted(featured)), _subtitle_bases(base))
 
 
 def _album_versions(album: str) -> tuple[tuple[str, str], ...]:
@@ -162,13 +197,32 @@ def _candidate_recording(candidate: Candidate) -> _Recording:
         by_kind[kind] = previous or detail
     if {"clean", "explicit"} <= by_kind.keys():
         conflict = True
-    return _Recording(title.base, tuple(sorted(by_kind.items())), conflict)
+    credits = set(title.featured) | {normalized(a) for a in candidate.artists}
+    return _Recording(title.base, tuple(sorted(by_kind.items())), conflict,
+                      featured=tuple(sorted(credits)), subtitle_bases=title.subtitle_bases)
+
+
+def _artist_matches(artist: str, recording: _Recording, *, allow_article: bool = False) -> bool:
+    def matches(name: str) -> bool:
+        name = normalized(name)
+        return name in recording.featured or (
+            allow_article and name.removeprefix("the ") in {
+                credit.removeprefix("the ") for credit in recording.featured
+            }
+        )
+
+    if matches(artist):
+        return True
+    # Keep full band names intact when credited as such. Otherwise an explicit
+    # collaboration must account for every requested artist, including guests.
+    names = re.split(r"\s+(?:(?:feat\.?|ft\.?|featuring)|&)\s+", artist, flags=re.I)
+    return len(names) > 1 and all(matches(name) for name in names)
 
 
 def _compatible(request: _Recording, recording: _Recording) -> bool:
     wanted = dict(request.versions)
     offered = dict(recording.versions)
-    return wanted.keys() == offered.keys() and all(
+    return set(request.featured) <= set(recording.featured) and wanted.keys() == offered.keys() and all(
         not detail or detail == offered[kind] or f" {detail} " in f" {offered[kind]} "
         for kind, detail in wanted.items()
     )
@@ -198,12 +252,11 @@ def resolve_candidates(
     if not original:
         return ResolutionDecision(None, "no_results", original)
     request = _title_recording(track.title)
-    artist = normalized(track.artist)
     same_song: list[tuple[Candidate, _Recording]] = []
     others: list[Candidate] = []
     for candidate in original:
         recording = _candidate_recording(candidate)
-        if recording.base == request.base and artist in {normalized(a) for a in candidate.artists}:
+        if recording.base == request.base and _artist_matches(track.artist, recording):
             same_song.append((candidate, recording))
         else:
             others.append(candidate)
@@ -215,15 +268,17 @@ def resolve_candidates(
 
     if not same_song:
         return decision("no_confident_match")
-    if request.unknown or any(r.unknown for _, r in same_song):
+    if request.unknown:
         return decision("unsupported_qualifier")
     if not compatible:
+        if any(r.unknown for _, r in same_song):
+            return decision("unsupported_qualifier")
         return decision("version_unavailable")
     if len(compatible) == 1:
         return decision("auto_single", compatible[0].video_id)
     if request.versions:
         return decision("multiple_recordings")
-    credits = {frozenset(normalized(a) for a in c.artists) for c in compatible}
+    credits = {r.featured for c, r in same_song if c in compatible}
     if len(credits) != 1:
         return decision("different_credits")
     durations = [_duration_seconds(c.duration) for c in compatible]
@@ -237,14 +292,14 @@ def resolve_candidates(
 
 
 def eligible_candidates(track: Track, candidates: Sequence[Candidate]) -> tuple[str, ...]:
-    """Allow release preferences, but never delegate song/version identity."""
+    """Allow release preferences and literal subtitle checks within version rules."""
     request = _title_recording(track.title)
     if request.unknown:
         return ()
-    artist = normalized(track.artist)
     return tuple(dict.fromkeys(
         c.video_id for c in candidates
-        if (recording := _candidate_recording(c)).base == request.base
+        if ((recording := _candidate_recording(c)).base == request.base
+            or request.base in recording.subtitle_bases)
         and not recording.unknown and _compatible(request, recording)
-        and artist in {normalized(a) for a in c.artists}
+        and _artist_matches(track.artist, recording, allow_article=True)
     ))

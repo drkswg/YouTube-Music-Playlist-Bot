@@ -307,6 +307,16 @@ class PlaylistWorkflow:
         self.store.save(draft)  # Persist the exact fresh snapshot before any model call.
         eligible = eligible_candidates(track, track.candidates)
         if is_custom or self.selector is None or track.status != "pending" or not eligible:
+            if track.status == "pending":
+                if is_custom:
+                    gemini_status = "custom_search"
+                elif self.selector is None:
+                    gemini_status = "not_configured"
+                else:
+                    gemini_status = "no_eligible_candidates"
+                log.info("Recording selection requires manual choice: source_line=%s rules_reason=%s "
+                         "gemini_status=%s candidates=%s eligible=%s",
+                         track.source_line, decision.reason, gemini_status, len(track.candidates), len(eligible))
             return
         value = SelectionInput.from_track(track, eligible, decision.reason)
         record = SelectionRecord("gemini", MODEL, POLICY, value.snapshot_hash(), track.search_revision)
@@ -354,6 +364,10 @@ class PlaylistWorkflow:
             if result.selected_id:
                 latest.selected = result.selected_id
                 latest.status = "selected"
+            else:
+                log.info("Recording selection requires manual choice: source_line=%s rules_reason=%s "
+                         "gemini_status=abstained candidates=%s eligible=%s",
+                         latest.source_line, decision.reason, len(latest.candidates), len(eligible))
         latest.selection_record = record
         self.store.save(current)
         # Continue the same resolution loop using the reloaded, validated state.

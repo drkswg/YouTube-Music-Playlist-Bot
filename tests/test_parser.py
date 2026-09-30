@@ -83,8 +83,90 @@ def test_version_words_in_ordinary_names_are_not_markers(title, album):
     ("Song (Clean Explicit)", "Album"),
     ("Song (Original)", "Live"),
 ])
-def test_unknown_or_conflicting_same_song_metadata_blocks_auto(title, album):
-    result = resolve_candidates(Track("Artist", "Song", 1), [song(), song("unclear", title, album)])
+def test_unknown_or_conflicting_candidate_does_not_block_compatible_recording(title, album):
+    unclear = song("unclear", title, album)
+    studio = song()
+    result = resolve_candidates(Track("Artist", "Song", 1), [unclear, studio])
+    assert result.selected_video_id == "studio" and result.reason == "auto_single"
+    assert result.ordered_candidates == (studio, unclear)
+    unavailable = resolve_candidates(Track("Artist", "Song", 1), [unclear])
+    assert unavailable.selected_video_id is None and unavailable.reason == "unsupported_qualifier"
+
+
+@pytest.mark.parametrize("credit", ["feat.", "feat", "ft.", "ft", "featuring", "FEAT."])
+def test_featured_artist_metadata_is_not_a_recording_version(credit):
+    studio = song(title=f"Song ({credit} Guest)")
+    remix = song("remix", f"Song (Remix) ({credit} Guest)")
+    result = resolve_candidates(Track("Artist", "Song", 1), [remix, studio])
+    assert result.selected_video_id == "studio" and result.reason == "auto_single"
+    assert resolve_candidates(Track("Artist", "Song", 1), [remix]).reason == "version_unavailable"
+
+
+def test_featured_artist_named_after_a_version_is_still_a_credit():
+    result = resolve_candidates(Track("Artist", "Song", 1), [song(title="Song (feat. Live)")])
+    assert result.selected_video_id == "studio"
+
+
+def test_featured_credits_participate_in_release_equivalence_and_requested_identity():
+    first = song("first", "Song (feat. Guest One)")
+    second = song("second", "Song (feat. Guest Two)")
+    assert resolve_candidates(Track("Artist", "Song", 1), [first, second]).reason == "different_credits"
+    result = resolve_candidates(Track("Artist", "Song (feat. Guest One)", 1), [second, first])
+    assert result.selected_video_id == "first"
+    metadata = song("metadata", artists=["Artist", "Guest One"])
+    assert resolve_candidates(Track("Artist", "Song (ft. Guest One)", 1), [metadata]).selected_video_id == "metadata"
+    assert resolve_candidates(Track("Artist", "Song", 1), [first, metadata]).reason == "auto_equivalent_releases"
+
+
+@pytest.mark.parametrize("title", ["Only Girl (In the World)", "Single Ladies (Put a Ring on It)"])
+def test_literal_parenthetical_title_is_preserved(title):
+    wrong = song("other", title.split(" (")[0])
+    studio = song(title=f"{title} (feat. Guest)")
+    live = song("live", f"{title} (Live)")
+    result = resolve_candidates(Track("Artist", title, 1), [wrong, live, studio])
+    assert result.selected_video_id == "studio"
+    assert result.ordered_candidates == (studio, live, wrong)
+
+
+def test_arbitrary_subtitle_is_not_dropped_from_song_identity():
+    result = resolve_candidates(Track("Artist", "Song", 1), [song(title="Song (Another Story)")])
+    assert result.selected_video_id is None and result.reason == "no_confident_match"
+
+
+@pytest.mark.parametrize("artist", ["David Guetta ft. Sia", "David Guetta feat. Sia", "David Guetta & Sia"])
+@pytest.mark.parametrize("artists,title", [
+    (["David Guetta", "Sia"], "Titanium"), (["David Guetta"], "Titanium (feat. Sia)"),
+])
+def test_requested_collaboration_matches_separate_artist_credits(artist, artists, title):
+    correct = song("correct", title, artists=artists)
+    missing_guest = song("missing_guest", "Titanium", artists=["David Guetta"])
+    cover = song("cover", "Titanium", artists=["Other", "Sia"])
+    result = resolve_candidates(Track(artist, "Titanium", 1), [missing_guest, cover, correct])
+    assert result.selected_video_id == "correct"
+    assert resolve_candidates(Track(artist, "Titanium", 1), [missing_guest, cover]).reason == "no_confident_match"
+
+
+def test_band_name_with_ampersand_matches_as_a_whole():
+    result = resolve_candidates(Track("Florence & The Machine", "Song", 1), [
+        song(artists=["Florence & The Machine"]),
+    ])
+    assert result.selected_video_id == "studio"
+
+
+@pytest.mark.parametrize("qualifier", ["Studio", "Studio Version", "Studio Recording",
+                                      'Studio Recording From "The Voice" Performance'])
+def test_explicit_studio_qualifier_does_not_block_original_recording(qualifier):
+    studio = song(title=f"Song ({qualifier}) (feat. Guest)")
+    result = resolve_candidates(Track("Artist", "Song", 1), [studio])
+    assert result.selected_video_id == "studio"
+    conflict = song(title=studio.title, album="Live")
+    assert resolve_candidates(Track("Artist", "Song", 1), [conflict]).reason == "unsupported_qualifier"
+
+
+@pytest.mark.parametrize("qualifier", ["Demo", "Special Version", "Radio Version", "Slowed", "Bonus Track"])
+def test_unrecognized_recording_qualifier_still_requires_manual_choice(qualifier):
+    title = f"Song ({qualifier})"
+    result = resolve_candidates(Track("Artist", title, 1), [song(title=title)])
     assert result.selected_video_id is None and result.reason == "unsupported_qualifier"
 
 
