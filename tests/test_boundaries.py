@@ -1,7 +1,9 @@
 import asyncio
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 from telegram.constants import ChatType
 
 from ym_playlist_maker.bot import BotUI
@@ -133,3 +135,117 @@ def test_unconfirmed_insert_shows_explicit_retry_button():
     assert "make sure" in message.sent[0][0]
     button = message.sent[0][1]["reply_markup"].inline_keyboard[0][0]
     assert button.callback_data == "d:draft123:retryinsert:0:2"
+
+
+@pytest.mark.parametrize("entry", ["create", "resume"])
+@pytest.mark.parametrize("failed", [False, True])
+def test_publish_ui_delivers_progress_on_loop_before_result(entry, failed):
+    events = []
+    draft = Draft("draft123", [Track("A", "B", 1, status="selected", selected="id")],
+                  phase="confirm" if entry == "create" else "writing", playlist_id="PL123")
+
+    async def run():
+        loop = asyncio.get_running_loop()
+        loop_thread = threading.get_ident()
+
+        class Message:
+            async def reply_text(self, text, **kwargs):
+                assert asyncio.get_running_loop() is loop
+                assert threading.get_ident() == loop_thread
+                await asyncio.sleep(0)
+                events.append(text)
+
+        def publish(*, on_playlist_pending=None):
+            assert threading.get_ident() != loop_thread
+            for attempt in range(3 if failed else 2):
+                events.append(f"read {attempt + 1}")
+                on_playlist_pending()
+                assert events[-1] == "The playlist is still being created. Please wait."
+            if failed:
+                raise RuntimeError("playlist unavailable")
+            draft.phase = "done"
+            draft.tracks[0].status = "added"
+            return draft
+
+        workflow = SimpleNamespace(active=lambda: draft, publish=publish)
+        ui = BotUI(BotConfig("dummy", 123, Path("unused")), workflow)
+
+        async def answer():
+            pass
+
+        update = SimpleNamespace(
+            effective_user=SimpleNamespace(id=123), effective_chat=SimpleNamespace(type=ChatType.PRIVATE),
+            effective_message=Message(), callback_query=SimpleNamespace(data="d:draft123:create", answer=answer),
+        )
+        if entry == "create":
+            await ui.callback(update, None)
+        else:
+            await ui.resume(update, None)
+
+    asyncio.run(run())
+    expected = []
+    for attempt in range(3 if failed else 2):
+        expected.extend([f"read {attempt + 1}", "The playlist is still being created. Please wait."])
+    assert events[:-1] == expected
+    if failed:
+        assert events[-1] == "Error: RuntimeError: playlist unavailable\nUse /resume to continue."
+    else:
+        assert events[-1] == "Done: 1 songs. https://music.youtube.com/playlist?list=PL123"
+
+
+@pytest.mark.parametrize("outcome", ["success", "failure"])
+def test_progress_delivery_failure_does_not_replace_publish_outcome(outcome, caplog):
+    draft = Draft("draft123", [], phase="done", playlist_id="PL123")
+    original = RuntimeError("YouTube result")
+
+    class Message:
+        async def reply_text(self, text):
+            raise OSError("Telegram unavailable")
+
+    def publish(*, on_playlist_pending=None):
+        on_playlist_pending()
+        if outcome == "failure":
+            raise original
+        return draft
+
+    ui = BotUI(BotConfig("dummy", 123, Path("unused")), SimpleNamespace(publish=publish))
+    update = SimpleNamespace(effective_message=Message())
+    if outcome == "failure":
+        with pytest.raises(RuntimeError) as caught:
+            asyncio.run(ui._publish(update))
+        assert caught.value is original
+    else:
+        assert asyncio.run(ui._publish(update)) is draft
+    assert "Could not send playlist creation progress" in caplog.text
+
+
+def test_progress_delivery_timeout_cancels_notification_without_failing_publish(monkeypatch, caplog):
+    draft = Draft("draft123", [], phase="done", playlist_id="PL123")
+    futures = []
+
+    class TimedOutFuture:
+        cancelled = False
+
+        def result(self, timeout):
+            assert timeout == 10
+            raise TimeoutError("delivery timed out")
+
+        def cancel(self):
+            self.cancelled = True
+
+    def schedule(coroutine, loop):
+        coroutine.close()
+        future = TimedOutFuture()
+        futures.append(future)
+        return future
+
+    monkeypatch.setattr("ym_playlist_maker.bot.asyncio.run_coroutine_threadsafe", schedule)
+
+    def publish(*, on_playlist_pending=None):
+        on_playlist_pending()
+        return draft
+
+    ui = BotUI(BotConfig("dummy", 123, Path("unused")), SimpleNamespace(publish=publish))
+    assert asyncio.run(ui._publish(SimpleNamespace(effective_message=CollectMessage()))) is draft
+    assert futures[0].cancelled
+    assert "Could not send playlist creation progress" in caplog.text

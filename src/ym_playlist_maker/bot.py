@@ -8,7 +8,7 @@ from telegram.constants import ChatType
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
 from .config import BotConfig
-from .models import selected_candidate
+from .models import Draft, selected_candidate
 from .service import PlaylistWorkflow, UnconfirmedInsert, WorkflowError
 
 log = logging.getLogger(__name__)
@@ -54,7 +54,7 @@ class BotUI:
                 if not draft:
                     await update.effective_message.reply_text("No draft. Send a list of songs.")
                 elif draft.phase in ("creating", "writing"):
-                    draft = await asyncio.to_thread(self.workflow.publish)
+                    draft = await self._publish(update)
                     await self._done(update, draft)
                 else:
                     await self._show_state(update)
@@ -115,7 +115,7 @@ class BotUI:
                     await update.effective_message.reply_text("Send a new search query for this song.")
                     return
                 elif action == "create" and len(parts) == 3:
-                    draft = await asyncio.to_thread(self.workflow.publish)
+                    draft = await self._publish(update)
                     await self._done(update, draft)
                     return
                 elif action == "retryinsert" and len(parts) == 5:
@@ -133,6 +133,25 @@ class BotUI:
                 await update.effective_message.reply_text("Invalid button; use /resume.")
             except Exception as exc:
                 await self._error(update, exc)
+
+    async def _publish(self, update: Update) -> Draft:
+        loop = asyncio.get_running_loop()
+
+        def on_playlist_pending() -> None:
+            future = None
+            notification = None
+            try:
+                notification = update.effective_message.reply_text("The playlist is still being created. Please wait.")
+                future = asyncio.run_coroutine_threadsafe(notification, loop)
+                future.result(timeout=10)
+            except Exception:
+                if future is not None:
+                    future.cancel()
+                elif notification is not None:
+                    notification.close()
+                log.warning("Could not send playlist creation progress", exc_info=True)
+
+        return await asyncio.to_thread(self.workflow.publish, on_playlist_pending=on_playlist_pending)
 
     async def _show_state(self, update: Update) -> None:
         draft, index = await asyncio.to_thread(self.workflow.next_unresolved)

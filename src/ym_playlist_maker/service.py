@@ -1,5 +1,7 @@
 """Synchronous, serialized draft workflow. The Telegram layer runs this in a worker thread."""
 
+from collections.abc import Callable
+from time import sleep
 from uuid import uuid4
 
 from googleapiclient.errors import HttpError
@@ -142,7 +144,7 @@ class PlaylistWorkflow:
         self.store.save(draft)  # Persist the owner's approval before another write attempt.
         return self._write_tracks(draft)
 
-    def publish(self) -> Draft:
+    def publish(self, *, on_playlist_pending: Callable[[], None] | None = None) -> Draft:
         draft = self._require()
         if draft.phase == "done":
             return draft
@@ -172,9 +174,26 @@ class PlaylistWorkflow:
             self.store.save(draft)
         if draft.phase != "writing" or not draft.playlist_id:
             raise WorkflowError("The draft is not ready for playlist creation yet")
-        return self._write_tracks(draft)
+        return self._write_tracks(draft, on_playlist_pending=on_playlist_pending)
 
-    def _write_tracks(self, draft: Draft) -> Draft:
+    def _initial_item_ids(self, draft: Draft, on_playlist_pending: Callable[[], None] | None) -> list[str]:
+        # Once an insertion has been attempted, preserve immediate reconciliation.
+        if any(t.status in ("added", "uncertain") or t.insert_revision > 0 for t in draft.tracks):
+            return self.youtube.item_ids(draft.playlist_id)
+        for attempt in range(3):
+            sleep(1)
+            try:
+                return self.youtube.item_ids(draft.playlist_id)
+            except HttpError as exc:
+                if exc.resp.status != 404 or http_error_reason(exc) != "playlistNotFound":
+                    raise
+                if on_playlist_pending is not None:
+                    on_playlist_pending()
+                if attempt == 2:
+                    raise
+        raise AssertionError("Playlist readiness attempts exhausted without a result")
+
+    def _write_tracks(self, draft: Draft, *, on_playlist_pending: Callable[[], None] | None = None) -> Draft:
         target_ids: list[str] = []
         seen: set[str] = set()
         for track in draft.tracks:
@@ -188,7 +207,7 @@ class PlaylistWorkflow:
             seen.add(track.selected)
             target_ids.append(track.selected)
 
-        remote = self.youtube.item_ids(draft.playlist_id)
+        remote = self._initial_item_ids(draft, on_playlist_pending)
         if remote != target_ids[:len(remote)]:
             raise UncertainWrite("The playlist contents were changed outside the bot; writing has stopped")
         if any(t.status == "added" and t.selected not in remote for t in draft.tracks):

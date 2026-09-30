@@ -40,6 +40,8 @@ class FakeYouTube:
         self.add_error = None
         self.lag_item_reads = False
         self.item_reads = 0
+        self.item_errors = []
+        self.events = []
 
     def check_credentials(self):
         pass
@@ -59,6 +61,9 @@ class FakeYouTube:
 
     def item_ids(self, _playlist_id):
         self.item_reads += 1
+        self.events.append(("read", _playlist_id))
+        if self.item_errors:
+            raise self.item_errors.pop(0)
         return [] if self.lag_item_reads else list(self.items)
 
     def add(self, _playlist_id, video_id):
@@ -78,9 +83,10 @@ class FakeYouTube:
 
 
 @pytest.fixture
-def setup(tmp_path: Path):
+def setup(tmp_path: Path, monkeypatch):
     store = DraftStore(tmp_path / "state.sqlite3")
     youtube = FakeYouTube()
+    monkeypatch.setattr("ym_playlist_maker.service.sleep", lambda seconds: youtube.events.append(("sleep", seconds)))
     workflow = PlaylistWorkflow(store, FakeSearch(), youtube)
     yield workflow, youtube, store
     store.close()
@@ -261,4 +267,81 @@ def test_insert_404_only_skips_missing_video(setup, reason, skipped):
             workflow.publish()
         assert workflow.active().tracks[0].status == "selected"
         assert youtube.items == []
+
+
+@pytest.mark.parametrize("failures", [0, 1, 2])
+def test_initial_read_waits_and_retries_until_ready(setup, failures):
+    workflow, youtube, _ = setup
+    prepare(workflow)
+    youtube.item_errors = [api_error(404, "playlistNotFound") for _ in range(failures)]
+    result = workflow.publish(on_playlist_pending=lambda: youtube.events.append(("pending", None)))
+    assert result.phase == "done"
+    assert youtube.events == [("sleep", 1), ("read", "playlist1"), ("pending", None)] * failures + [
+        ("sleep", 1), ("read", "playlist1")
+    ]
+    assert youtube.items == ["oasis", "numb1"]
+
+
+def test_exhausted_read_preserves_error_and_resume_uses_same_playlist(setup):
+    workflow, youtube, store = setup
+    prepare(workflow)
+    errors = [api_error(404, "playlistNotFound") for _ in range(3)]
+    youtube.item_errors = errors.copy()
+    with pytest.raises(HttpError) as error:
+        workflow.publish(on_playlist_pending=lambda: youtube.events.append(("pending", None)))
+    assert error.value is errors[-1]
+    assert youtube.events == [("sleep", 1), ("read", "playlist1"), ("pending", None)] * 3
+    assert youtube.items == []
+    draft = workflow.active()
+    assert draft.playlist_id == "playlist1" and draft.phase == "writing"
+    assert all(track.insert_revision == 0 for track in draft.tracks)
+    recovered = PlaylistWorkflow(store, FakeSearch(), youtube)
+    assert recovered.publish().phase == "done"
+    assert len(youtube.created) == 1
+    assert youtube.events[-2:] == [("sleep", 1), ("read", "playlist1")]
+
+
+@pytest.mark.parametrize("error", [
+    api_error(404, "videoNotFound"), api_error(403, "forbidden"),
+    api_error(503, "backendError"), TimeoutError("offline"),
+])
+def test_initial_read_other_failures_propagate_without_retry(setup, error):
+    workflow, youtube, _ = setup
+    prepare(workflow)
+    youtube.item_errors = [error]
+    with pytest.raises(type(error)) as caught:
+        workflow.publish(on_playlist_pending=lambda: pytest.fail("Unexpected readiness notification"))
+    assert caught.value is error
+    assert youtube.events == [("sleep", 1), ("read", "playlist1")]
+    assert youtube.items == []
+
+
+def test_lost_create_response_recovery_waits_for_readiness(setup):
+    workflow, youtube, _ = setup
+    prepare(workflow)
+    youtube.fail_create_after_commit = True
+    with pytest.raises(UncertainWrite):
+        workflow.publish()
+    youtube.item_errors = [api_error(404, "playlistNotFound")]
+    assert workflow.publish().phase == "done"  # callback remains optional
+    assert len(youtube.created) == 1
+    assert youtube.events == [("sleep", 1), ("read", "playlist1")] * 2
+
+
+@pytest.mark.parametrize("status,revision", [("added", 0), ("uncertain", 0), ("selected", 1)])
+def test_insertion_history_bypasses_readiness_retries(setup, status, revision):
+    workflow, youtube, store = setup
+    draft = prepare(workflow)
+    draft.phase = "writing"
+    draft.playlist_id = "playlist1"
+    draft.tracks[0].status = status
+    draft.tracks[0].insert_revision = revision
+    store.save(draft)
+    error = api_error(404, "playlistNotFound")
+    youtube.item_errors = [error]
+    with pytest.raises(HttpError) as caught:
+        workflow.publish(on_playlist_pending=lambda: pytest.fail("Unexpected readiness notification"))
+    assert caught.value is error
+    assert youtube.events == [("read", "playlist1")]
+    assert youtube.items == []
 
