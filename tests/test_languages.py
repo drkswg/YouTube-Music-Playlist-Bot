@@ -318,3 +318,11 @@ def test_all_translations_preserve_format_fields_and_command_names():
             assert not fields or "value{literal}" in rendered
     assert translate("unknown", "Draft cancelled.") == "Draft cancelled."
     assert translate_saved_message("ru", "External diagnostic {raw}") == "External diagnostic {raw}"
+
+
+@pytest.mark.parametrize("language", ["ru", "es", "de", "fr", "pt"])
+def test_old_duplicate_diagnostic_is_localized(language):
+    from ym_playlist_maker.i18n import translate_saved_message
+    source = "Line 17: duplicate recording skipped"
+    translated = translate_saved_message(language, source)
+    assert translated != source and "17" in translated

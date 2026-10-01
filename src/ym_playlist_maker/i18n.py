@@ -574,7 +574,67 @@ _CATALOG: dict[str, tuple[str, ...]] = {
     ),
 }
 
+
+_CATALOG.update({
+    "YouTube quota or request limits have been reached. Check Google Cloud quotas and use /resume after the limit resets.": (
+        "Исчерпана квота или лимит запросов YouTube. Проверьте квоты Google Cloud и используйте /resume после сброса лимита.",
+        "Se alcanzó la cuota o el límite de solicitudes de YouTube. Consulta las cuotas de Google Cloud y usa /resume cuando se restablezca el límite.",
+        "Das YouTube-Kontingent oder Anfragelimit ist erreicht. Prüfe die Google-Cloud-Kontingente und nutze /resume nach dem Zurücksetzen des Limits.",
+        "Le quota ou la limite de requêtes YouTube est atteint. Vérifiez les quotas Google Cloud et utilisez /resume après leur réinitialisation.",
+        "A cota ou o limite de solicitações do YouTube foi atingido. Verifique as cotas do Google Cloud e use /resume após a redefinição do limite.",
+    ),
+    "Google authorization lacks the required YouTube permissions. Repeat authorization using the README instructions, then use /resume.": (
+        "В авторизации Google отсутствуют необходимые права YouTube. Повторите авторизацию по инструкции README, затем используйте /resume.",
+        "La autorización de Google carece de los permisos necesarios de YouTube. Repite la autorización siguiendo el README y usa /resume.",
+        "Der Google-Autorisierung fehlen die erforderlichen YouTube-Berechtigungen. Wiederhole die Autorisierung gemäß README und nutze /resume.",
+        "L’autorisation Google ne dispose pas des permissions YouTube requises. Refaites l’autorisation selon le README, puis utilisez /resume.",
+        "A autorização do Google não tem as permissões necessárias do YouTube. Repita a autorização conforme o README e use /resume.",
+    ),
+    "Google authorization is missing or expired. Repeat authorization using the README instructions, then use /resume.": (
+        "Авторизация Google отсутствует или истекла. Повторите авторизацию по инструкции README, затем используйте /resume.",
+        "La autorización de Google falta o ha caducado. Repite la autorización siguiendo el README y usa /resume.",
+        "Die Google-Autorisierung fehlt oder ist abgelaufen. Wiederhole die Autorisierung gemäß README und nutze /resume.",
+        "L’autorisation Google est absente ou a expiré. Refaites l’autorisation selon le README, puis utilisez /resume.",
+        "A autorização do Google está ausente ou expirou. Repita a autorização conforme o README e use /resume.",
+    ),
+    "An external service timed out. Check your connection and use /resume to reconcile the saved state.": (
+        "Время ожидания внешнего сервиса истекло. Проверьте соединение и используйте /resume для сверки сохранённого состояния.",
+        "Un servicio externo agotó el tiempo de espera. Comprueba tu conexión y usa /resume para conciliar el estado guardado.",
+        "Ein externer Dienst hat das Zeitlimit überschritten. Prüfe die Verbindung und nutze /resume zum Abgleich des gespeicherten Zustands.",
+        "Un service externe a dépassé le délai d’attente. Vérifiez la connexion et utilisez /resume pour vérifier l’état enregistré.",
+        "Um serviço externo excedeu o tempo limite. Verifique sua conexão e use /resume para reconciliar o estado salvo.",
+    ),
+    "An external service could not be reached. Check your connection and use /resume to reconcile the saved state.": (
+        "Внешний сервис недоступен. Проверьте соединение и используйте /resume для сверки сохранённого состояния.",
+        "No se pudo contactar con un servicio externo. Comprueba tu conexión y usa /resume para conciliar el estado guardado.",
+        "Ein externer Dienst ist nicht erreichbar. Prüfe die Verbindung und nutze /resume zum Abgleich des gespeicherten Zustands.",
+        "Un service externe est inaccessible. Vérifiez la connexion et utilisez /resume pour vérifier l’état enregistré.",
+        "Não foi possível acessar um serviço externo. Verifique sua conexão e use /resume para reconciliar o estado salvo.",
+    ),
+    "The creation request was not sent. Fix authorization or network issues and use /resume": (
+        "Запрос на создание не отправлен. Исправьте авторизацию или проблемы сети и используйте /resume",
+        "La solicitud de creación no se envió. Soluciona la autorización o la red y usa /resume",
+        "Die Erstellungsanfrage wurde nicht gesendet. Behebe Autorisierungs- oder Netzwerkprobleme und nutze /resume",
+        "La requête de création n’a pas été envoyée. Corrigez l’autorisation ou le réseau et utilisez /resume",
+        "A solicitação de criação não foi enviada. Corrija a autorização ou a rede e use /resume",
+    ),
+    "An external service or internal operation failed. Check the bot logs for the error category.": (
+        "Ошибка внешнего сервиса или внутренней операции. Категория ошибки записана в журнале бота.",
+        "Falló un servicio externo o una operación interna. Consulta la categoría del error en el registro del bot.",
+        "Ein externer Dienst oder interner Vorgang ist fehlgeschlagen. Die Fehlerkategorie steht im Bot-Protokoll.",
+        "Un service externe ou une opération interne a échoué. Consultez la catégorie d’erreur dans le journal du bot.",
+        "Um serviço externo ou uma operação interna falhou. Consulte a categoria do erro no registro do bot.",
+    ),
+    "Line {line}: duplicate recording skipped": (
+        "Строка {line}: повторная запись пропущена", "Línea {line}: grabación duplicada omitida",
+        "Zeile {line}: doppelte Aufnahme übersprungen", "Ligne {line} : enregistrement en double ignoré",
+        "Linha {line}: gravação duplicada ignorada",
+    ),
+})
+
 _SAVED_MESSAGES = (
+    (re.compile(r"Line (?P<line>\d+): duplicate recording skipped"),
+     "Line {line}: duplicate recording skipped"),
     (re.compile(r"Line (?P<line>\d+): insertion is unconfirmed\. Check the playlist contents before retrying"),
      "Line {line}: insertion is unconfirmed. Check the playlist contents before retrying"),
     (re.compile(r"The outcome of inserting line (?P<line>\d+) is unknown; use /resume"),
@@ -601,3 +661,9 @@ def translate_saved_message(language: str, text: str) -> str:
         if match:
             return translate(language, source, **match.groupdict())
     return translate(language, text)
+
+
+def safe_workflow_message(text: str) -> bool:
+    """Only application-authored diagnostics may cross the error UI boundary."""
+    return (text in _CATALOG or text == "No draft. Send a list of songs"
+            or any(pattern.fullmatch(text) for pattern, _ in _SAVED_MESSAGES))

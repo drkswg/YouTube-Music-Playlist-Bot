@@ -15,7 +15,7 @@ def data_dir() -> Path:
 
 @dataclass(frozen=True)
 class BotConfig:
-    token: str
+    token: str = field(repr=False)
     owner_id: int
     directory: Path
     gemini_api_key: str = field(default="", repr=False)

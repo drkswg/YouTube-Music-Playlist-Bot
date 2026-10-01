@@ -243,3 +243,21 @@ def test_repeated_or_contradictory_requested_qualifiers_do_not_discard_intent(ti
     result = resolve_candidates(Track("Artist", title, 1), [candidate])
     assert result.reason == "unsupported_qualifier" and result.selected_video_id is None
 
+
+
+@pytest.mark.parametrize("title,album", [
+    ("Song", "Album (Demo)"), ("Song", "Album (Special Version)"),
+    ("Song", "Demo"), ("Song", "Special Version"),
+    ("Song (Live)", "Album (Studio Version)"),
+    ("Song (Live)", "Studio"), ("Song", "Album (Studio Version) (Live)"),
+    ("Song (Live at Wembley)", "Album (Live at Paris)"),
+])
+def test_album_uncertainty_and_studio_conflicts_are_excluded(title, album):
+    from ym_playlist_maker.parser import resolve_candidates, eligible_candidates
+    requested = Track("Artist", "Song (Live)" if "Live" in title else "Song", 1)
+    rejected = Candidate("bad", title, ["Artist"], album, "3:20")
+    compatible = Candidate("good", requested.title, ["Artist"], "Ordinary Album", "3:20")
+    assert resolve_candidates(requested, [rejected]).selected_video_id is None
+    assert eligible_candidates(requested, [rejected]) == ()
+    assert resolve_candidates(requested, [rejected, compatible]).selected_video_id == "good"
+    assert eligible_candidates(requested, [rejected, compatible]) == ("good",)

@@ -277,7 +277,7 @@ def test_initial_read_waits_and_retries_until_ready(setup, failures):
     result = workflow.publish(on_playlist_pending=lambda: youtube.events.append(("pending", None)))
     assert result.phase == "done"
     assert youtube.events == [("sleep", 1), ("read", "playlist1"), ("pending", None)] * failures + [
-        ("sleep", 1), ("read", "playlist1")
+        ("sleep", 1), ("read", "playlist1"), ("read", "playlist1")
     ]
     assert youtube.items == ["oasis", "numb1"]
 
@@ -298,7 +298,7 @@ def test_exhausted_read_preserves_error_and_resume_uses_same_playlist(setup):
     recovered = PlaylistWorkflow(store, FakeSearch(), youtube)
     assert recovered.publish().phase == "done"
     assert len(youtube.created) == 1
-    assert youtube.events[-2:] == [("sleep", 1), ("read", "playlist1")]
+    assert youtube.events[-3:] == [("sleep", 1), ("read", "playlist1"), ("read", "playlist1")]
 
 
 @pytest.mark.parametrize("error", [
@@ -325,7 +325,7 @@ def test_lost_create_response_recovery_waits_for_readiness(setup):
     youtube.item_errors = [api_error(404, "playlistNotFound")]
     assert workflow.publish().phase == "done"  # callback remains optional
     assert len(youtube.created) == 1
-    assert youtube.events == [("sleep", 1), ("read", "playlist1")] * 2
+    assert youtube.events == [("sleep", 1), ("read", "playlist1")] * 2 + [("read", "playlist1")]
 
 
 @pytest.mark.parametrize("status,revision", [("added", 0), ("uncertain", 0), ("selected", 1)])
@@ -442,3 +442,66 @@ def test_search_failure_leaves_saved_snapshot_and_revision_intact(setup):
         workflow.search_again(0, "new query")
     assert store.load().to_dict() == expected
 
+
+
+def test_creation_preparation_failure_returns_to_editable_confirm(setup):
+    from ym_playlist_maker.youtube import BeforeCreateError
+    workflow, youtube, _ = setup
+    prepare(workflow)
+    youtube.create_error = BeforeCreateError("synthetic private detail")
+    with pytest.raises(WorkflowError, match="creation request was not sent"):
+        workflow.publish()
+    assert workflow.active().phase == "confirm"
+    assert youtube.created == [] and youtube.items == []
+    assert workflow.edit(1).phase == "resolving"
+    workflow.cancel()
+    assert workflow.active() is None
+
+
+@pytest.mark.parametrize("failure", ["read", "missing", "reordered", "extra"])
+def test_final_verification_preserves_added_and_resume_does_not_insert_again(setup, failure):
+    workflow, youtube, store = setup
+    prepare(workflow)
+    original_read = youtube.item_ids
+    def read(playlist):
+        if youtube.items == ["oasis", "numb1"]:
+            if failure == "read":
+                raise TimeoutError("synthetic remote secret")
+            if failure == "missing":
+                return ["oasis"]
+            if failure == "reordered":
+                return ["numb1", "oasis"]
+            return ["oasis", "numb1", "outside"]
+        return original_read(playlist)
+    youtube.item_ids = read
+    with pytest.raises((TimeoutError, UncertainWrite)):
+        workflow.publish()
+    saved = store.load()
+    assert saved.phase == "writing"
+    assert [t.status for t in saved.tracks] == ["added", "added", "skipped"]
+    assert youtube.items == ["oasis", "numb1"]
+    youtube.item_ids = original_read
+    assert workflow.publish().phase == "done"
+    assert youtube.items == ["oasis", "numb1"]
+
+
+def test_final_verification_excludes_definitively_rejected_recording(setup):
+    workflow, youtube, _ = setup
+    prepare(workflow)
+    youtube.add_error = api_error(404, "videoNotFound")
+    result = workflow.publish()
+    assert result.phase == "done"
+    assert youtube.items == ["numb1"]
+    assert result.tracks[0].status == "skipped"
+
+
+def test_final_verification_accepts_empty_playlist_after_all_rejections(setup):
+    workflow, youtube, _ = setup
+    prepare(workflow)
+    def reject(playlist, video):
+        raise api_error(404, "videoNotFound")
+    youtube.add = reject
+    result = workflow.publish()
+    assert result.phase == "done"
+    assert all(track.status == "skipped" for track in result.tracks)
+    assert youtube.items == []

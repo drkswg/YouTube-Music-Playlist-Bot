@@ -12,7 +12,7 @@ from .models import Draft, Track, SelectionRecord
 from .parser import parse_tracks, resolve_candidates, eligible_candidates
 from .selection import MODEL, POLICY, SelectionInput, SelectionError, Selector
 from .store import DraftStore
-from .youtube import BeforeInsertError, http_error_reason
+from .youtube import BeforeCreateError, BeforeInsertError, http_error_reason
 
 
 log = logging.getLogger(__name__)
@@ -196,6 +196,10 @@ class PlaylistWorkflow:
             self.store.save(draft)
             try:
                 draft.playlist_id = self.youtube.create_private(draft.title, draft.create_marker)
+            except BeforeCreateError as exc:
+                draft.phase = "confirm"
+                self.store.save(draft)
+                raise WorkflowError("The creation request was not sent. Fix authorization or network issues and use /resume") from exc
             except HttpError as exc:
                 if exc.resp.status in (400, 401, 403, 404, 429):
                     draft.phase = "confirm"
@@ -289,6 +293,10 @@ class PlaylistWorkflow:
                 raise UncertainWrite(f"The outcome of inserting line {track.source_line} is unknown; use /resume") from exc
             track.status = "added"
             self.store.save(draft)
+        # Recompute after definitive rejections and duplicate skips.
+        expected = [t.selected for t in draft.tracks if t.status == "added" and t.selected]
+        if self.youtube.item_ids(draft.playlist_id) != expected:
+            raise UncertainWrite("The playlist contents were changed outside the bot; writing has stopped")
         draft.phase = "done"
         self.store.save(draft)
         return draft

@@ -47,11 +47,19 @@ def main() -> None:
     from telegram import Update
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    for name in ("httpx", "httpcore", "telegram", "googleapiclient.discovery"):
+        logging.getLogger(name).setLevel(logging.CRITICAL)
     config = bot_config()
     store = DraftStore(config.directory / "state.sqlite3")
-    workflow = PlaylistWorkflow(store, MusicSearch(), YouTubePlaylists(config.directory / "token.json"),
-                                GeminiSelector(config.gemini_api_key) if config.gemini_api_key else None)
-    build_application(config, workflow).run_polling(allowed_updates=Update.ALL_TYPES)
+    try:
+        workflow = PlaylistWorkflow(store, MusicSearch(), YouTubePlaylists(config.directory / "token.json"),
+                                    GeminiSelector(config.gemini_api_key) if config.gemini_api_key else None)
+        build_application(config, workflow).run_polling(allowed_updates=Update.ALL_TYPES)
+    except Exception as exc:
+        logging.getLogger(__name__).error("Bot stopped: error_type=%s", type(exc).__name__)
+        parser.exit(1, "Bot stopped after an external service or internal error. Check the error category in the logs.\n")
+    finally:
+        store.close()
 
 
 if __name__ == "__main__":

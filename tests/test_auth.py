@@ -277,3 +277,66 @@ def test_auth_cli_reports_client_configuration_errors(monkeypatch, tmp_path, cap
 def test_missing_credentials_explains_container_authorization(tmp_path):
     with pytest.raises(youtube.MissingCredentials, match="docker compose -f compose.auth.yaml"):
         youtube.YouTubePlaylists(tmp_path / "absent.json").check_credentials()
+
+
+@pytest.mark.parametrize("failure", [None, "replace", "write"])
+def test_refresh_saves_atomically_and_preserves_previous_token(monkeypatch, tmp_path, failure):
+    token = tmp_path / "token.json"
+    token.write_text("previous synthetic token", encoding="utf-8")
+    refresh_calls = []
+    credentials = SimpleNamespace(valid=False, refresh_token="synthetic refresh token",
+                                  refresh=lambda request: refresh_calls.append(request),
+                                  to_json=lambda: "new synthetic token")
+    monkeypatch.setattr(youtube.Credentials, "from_authorized_user_file", lambda *args, **kwargs: credentials)
+    service = object()
+    monkeypatch.setattr(youtube, "build", lambda *args, **kwargs: service)
+    if failure:
+        if failure == "replace":
+            monkeypatch.setattr(Path, "replace", lambda *args: (_ for _ in ()).throw(OSError("disk error")))
+        else:
+            original_temporary = youtube.tempfile.NamedTemporaryFile
+            def temporary(*args, **kwargs):
+                handle = original_temporary(*args, **kwargs)
+                handle.write = lambda text: (_ for _ in ()).throw(OSError("disk full"))
+                return handle
+            monkeypatch.setattr(youtube.tempfile, "NamedTemporaryFile", temporary)
+        with pytest.raises(OSError):
+            youtube.YouTubePlaylists(token)._service()
+        assert token.read_text(encoding="utf-8") == "previous synthetic token"
+    else:
+        assert youtube.YouTubePlaylists(token)._service() is service
+        assert token.read_text(encoding="utf-8") == "new synthetic token"
+    assert len(refresh_calls) == 1
+    assert list(tmp_path.iterdir()) == [token]
+
+
+@pytest.mark.parametrize("failed", [False, True])
+def test_bot_cli_closes_store_and_logs_safely(monkeypatch, tmp_path, caplog, capsys, failed):
+    from ym_playlist_maker.config import BotConfig
+    from ym_playlist_maker import bot, search, selection, service, store
+    events = []
+    monkeypatch.setattr(sys, "argv", ["ym_playlist_maker", "bot"])
+    monkeypatch.setattr(cli, "data_dir", lambda: tmp_path)
+    monkeypatch.setattr(cli, "bot_config", lambda: BotConfig("SYNTHETIC_SECRET", 123, tmp_path, "gemini"))
+    monkeypatch.setattr(store, "DraftStore", lambda path: SimpleNamespace(close=lambda: events.append("close")))
+    monkeypatch.setattr(search, "MusicSearch", lambda: None)
+    monkeypatch.setattr(selection, "GeminiSelector", lambda key: events.append(("selector", key)))
+    monkeypatch.setattr(service, "PlaylistWorkflow", lambda *args: None)
+    def polling(**kwargs):
+        events.append("polling")
+        import logging
+        logging.getLogger("httpx").info("https://api.telegram.org/botSYNTHETIC_SECRET/getUpdates")
+        if failed:
+            raise RuntimeError("SYNTHETIC_SECRET")
+    monkeypatch.setattr(bot, "build_application", lambda *args: SimpleNamespace(run_polling=polling))
+    import logging
+    for name in ("httpx", "httpcore", "telegram", "googleapiclient.discovery"):
+        monkeypatch.setattr(logging.getLogger(name), "level", logging.NOTSET)
+    if failed:
+        with pytest.raises(SystemExit) as exc:
+            cli.main()
+        assert exc.value.code == 1
+    else:
+        cli.main()
+    assert events == [("selector", "gemini"), "polling", "close"]
+    assert "SYNTHETIC_SECRET" not in caplog.text + capsys.readouterr().err

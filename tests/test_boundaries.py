@@ -322,7 +322,7 @@ def test_publish_ui_delivers_progress_on_loop_before_result(entry, failed):
         expected.extend([f"read {attempt + 1}", "The playlist is still being created. Please wait."])
     assert events[:-1] == expected
     if failed:
-        assert events[-1] == "Error: RuntimeError: playlist unavailable\nUse /resume to continue."
+        assert events[-1] == "Error: An external service or internal operation failed. Check the bot logs for the error category.\nUse /resume to continue."
     else:
         assert events[-1] == "Done: 1 songs. https://music.youtube.com/playlist?list=PL123"
 
@@ -383,3 +383,210 @@ def test_progress_delivery_timeout_cancels_notification_without_failing_publish(
     assert asyncio.run(ui._publish(SimpleNamespace(effective_message=CollectMessage()))) is draft
     assert futures[0].cancelled
     assert "Could not send playlist creation progress" in caplog.text
+
+
+@pytest.mark.parametrize("boundary", ["service", "construction", "dispatch"])
+def test_creation_boundary_distinguishes_prepare_from_dispatch(boundary):
+    from ym_playlist_maker.youtube import BeforeCreateError
+    adapter = YouTubePlaylists(Path("unused"))
+    fake = FakeService()
+    calls = []
+    def fail():
+        calls.append(boundary)
+        raise TimeoutError("synthetic private detail")
+    if boundary == "service":
+        adapter._service = fail
+    else:
+        adapter._service = lambda: fake
+        if boundary == "construction":
+            fake.playlist_collection.insert = lambda **kwargs: fail()
+        else:
+            fake.playlist_collection.execute = fail
+    expected = TimeoutError if boundary == "dispatch" else BeforeCreateError
+    with pytest.raises(expected):
+        adapter.create_private("Title", "marker")
+    assert calls == [boundary]
+
+
+@pytest.mark.parametrize("exception", [
+    RuntimeError("SYNTHETIC_SECRET"),
+    UnconfirmedInsert(0, 1, 2),
+])
+def test_workflow_errors_never_print_chained_provider_secrets(caplog, exception):
+    exception.__cause__ = ValueError("SYNTHETIC_SECRET")
+    draft = Draft("draft123", [])
+    ui = BotUI(BotConfig("SYNTHETIC_SECRET", 123, Path("unused")), SimpleNamespace(active=lambda: draft))
+    message = CollectMessage()
+    asyncio.run(ui._error(SimpleNamespace(effective_message=message), exception))
+    assert "SYNTHETIC_SECRET" not in caplog.text
+    assert "SYNTHETIC_SECRET" not in str(message.sent)
+    assert "SYNTHETIC_SECRET" not in repr(ui.config)
+    assert type(exception).__name__ in caplog.text
+    assert all(record.exc_info is None for record in caplog.records)
+
+
+def test_unknown_workflow_message_is_not_trusted(caplog):
+    from ym_playlist_maker.service import WorkflowError
+    ui = BotUI(BotConfig("dummy", 123, Path("unused")), None)
+    message = CollectMessage()
+    asyncio.run(ui._error(SimpleNamespace(effective_message=message), WorkflowError("SYNTHETIC_SECRET")))
+    assert "SYNTHETIC_SECRET" not in caplog.text + str(message.sent)
+
+
+def test_global_error_handler_registered_and_contains_notification_failure(monkeypatch, caplog):
+    from telegram import Chat, Message, User, Update
+    from datetime import datetime, timezone
+    app = build_application(BotConfig("123:dummy", 123, Path("unused")), None)
+    assert len(app.error_handlers) == 1
+    handler = next(iter(app.error_handlers))
+    update = Update(1, message=Message(1, datetime.now(timezone.utc), Chat(123, "private"),
+                                       from_user=User(123, "Owner", False), text="SYNTHETIC_SECRET"))
+    send = AsyncMock(side_effect=BadRequest("SYNTHETIC_SECRET"))
+    monkeypatch.setattr("telegram.Message.reply_text", send)
+    context = SimpleNamespace(error=RuntimeError("SYNTHETIC_SECRET"))
+    asyncio.run(handler(update, context))
+    send.assert_awaited_once()
+    assert "Could not send error notification" in caplog.text
+    assert "SYNTHETIC_SECRET" not in caplog.text
+    assert all(record.exc_info is None for record in caplog.records)
+
+
+@pytest.mark.parametrize("text", ["A" * 10001, "😀" * 5000, "first\n" + "B" * 4000 + "\nlast"],
+                         ids=["long-line", "astral-unicode", "multiline"])
+def test_shared_sender_preserves_text_and_keyboard_on_last_fragment(text):
+    ui = BotUI(BotConfig("dummy", 123, Path("unused")), None)
+    message = CollectMessage()
+    keyboard = object()
+    asyncio.run(ui._send_text(SimpleNamespace(effective_message=message), text, reply_markup=keyboard))
+    assert "".join(part for part, _ in message.sent) == text
+    assert all(len(part.encode("utf-16-le")) // 2 <= 3500 for part, _ in message.sent)
+    assert all(not kwargs for _, kwargs in message.sent[:-1])
+    assert message.sent[-1][1] == {"reply_markup": keyboard}
+
+
+def test_long_candidates_are_delivered_with_unchanged_button_revision():
+    candidate = Candidate("id", "Song" + "X" * 5000, ["Artist"], "Album" + "Y" * 3000)
+    track = Track("Artist", "Song" + "Z" * 4090, 1, candidates=[candidate], search_revision=7,
+                  search_query="saved")
+    draft = Draft("draft123", [track])
+    ui = BotUI(BotConfig("dummy", 123, Path("unused")), SimpleNamespace(next_unresolved=lambda: (draft, 0)))
+    message = CollectMessage()
+    asyncio.run(ui._show_state(SimpleNamespace(effective_message=message)))
+    text = "".join(part for part, _ in message.sent)
+    assert candidate.title in text and candidate.album in text and track.title in text
+    assert all(len(part.encode("utf-16-le")) // 2 <= 3500 for part, _ in message.sent)
+    assert all("reply_markup" not in kwargs for _, kwargs in message.sent[:-1])
+    keyboard = message.sent[-1][1]["reply_markup"]
+    assert keyboard.inline_keyboard[0][0].callback_data == "d:draft123:pick:0:7:0"
+
+
+@pytest.mark.parametrize("user_id,draft_id", [(123, "current"), (456, "current"), (123, "stale")])
+def test_failed_callback_ack_does_not_bypass_access_or_draft_checks(user_id, draft_id, caplog):
+    chosen = []
+    draft = Draft("current", [Track("Artist", "Song", 1)])
+    workflow = SimpleNamespace(active=lambda: draft, choose=lambda *args: chosen.append(args),
+                               next_unresolved=lambda: (Draft("current", [], phase="title"), None))
+    ui = BotUI(BotConfig("dummy", 123, Path("unused")), workflow)
+    message = CollectMessage()
+    update = SimpleNamespace(effective_user=SimpleNamespace(id=user_id),
+                             effective_chat=SimpleNamespace(type=ChatType.PRIVATE), effective_message=message,
+                             callback_query=SimpleNamespace(data=f"d:{draft_id}:pick:0:3:0",
+                                 answer=AsyncMock(side_effect=BadRequest("SYNTHETIC_SECRET"))))
+    asyncio.run(ui.callback(update, None))
+    assert chosen == ([(0, 0, 3)] if user_id == 123 and draft_id == "current" else [])
+    assert "SYNTHETIC_SECRET" not in caplog.text + str(message.sent)
+
+
+def _diagnostic_http_error(reason, status=403):
+    import json
+    from googleapiclient.errors import HttpError
+    from httplib2 import Response
+    return HttpError(Response({"status": str(status)}), json.dumps({
+        "error": {"message": "SYNTHETIC_SECRET", "errors": [{"reason": reason, "message": "SYNTHETIC_SECRET"}]}
+    }).encode(), uri="https://provider.invalid/SYNTHETIC_SECRET")
+
+
+def test_quota_and_permission_errors_have_distinct_actionable_safe_diagnostics(caplog):
+    draft = Draft("draft123", [], phase="confirm")
+    ui = BotUI(BotConfig("dummy", 123, Path("unused")), SimpleNamespace(active=lambda: draft))
+    message = CollectMessage()
+    for reason in ("quotaExceeded", "insufficientPermissions"):
+        exc = _diagnostic_http_error(reason)
+        exc.__cause__ = RuntimeError("SYNTHETIC_SECRET")
+        asyncio.run(ui._error(SimpleNamespace(effective_message=message), exc))
+    assert message.sent[0][0] != message.sent[1][0]
+    assert "after the limit resets" in message.sent[0][0]
+    assert "Repeat authorization" in message.sent[1][0]
+    assert "error_code=youtube_quota" in caplog.text
+    assert "error_code=youtube_permissions" in caplog.text
+    assert "http_status=403" in caplog.text and "phase=confirm" in caplog.text
+    assert "SYNTHETIC_SECRET" not in caplog.text + str(message.sent)
+    assert all(record.exc_info is None for record in caplog.records)
+
+
+@pytest.mark.parametrize("kind,category", [
+    ("credentials", "google_auth"), ("refresh", "google_auth"),
+    ("timeout", "network_timeout"), ("connection", "network_error"),
+    ("quota", "youtube_quota"), ("permissions", "youtube_permissions"),
+])
+@pytest.mark.parametrize("language", ["en", "ru", "es", "de", "fr", "pt"])
+def test_actionable_external_errors_are_localized_and_do_not_reveal_provider_text(kind, category, language, caplog):
+    from google.auth.exceptions import RefreshError
+    from ym_playlist_maker.bot import _EXTERNAL_ERROR_MESSAGES
+    from ym_playlist_maker.i18n import translate
+    errors = {
+        "credentials": MissingCredentials("SYNTHETIC_SECRET"),
+        "refresh": RefreshError("SYNTHETIC_SECRET"),
+        "timeout": TimeoutError("SYNTHETIC_SECRET"),
+        "connection": ConnectionError("SYNTHETIC_SECRET"),
+        "quota": _diagnostic_http_error("quotaExceeded"),
+        "permissions": _diagnostic_http_error("insufficientPermissions"),
+    }
+    ui = BotUI(BotConfig("dummy", 123, Path("unused")), None)
+    ui.language_code = language
+    message = CollectMessage()
+    exc = errors[kind]
+    exc.__context__ = RuntimeError("SYNTHETIC_SECRET")
+    asyncio.run(ui._error(SimpleNamespace(effective_message=message), exc))
+    expected = translate(language, _EXTERNAL_ERROR_MESSAGES[category])
+    assert expected in message.sent[0][0] and "/resume" in expected
+    if language != "en":
+        assert expected != _EXTERNAL_ERROR_MESSAGES[category]
+    assert f"error_code={category}" in caplog.text
+    assert "SYNTHETIC_SECRET" not in caplog.text + str(message.sent)
+    assert all(record.exc_info is None for record in caplog.records)
+
+
+def test_unknown_http_reason_body_and_draft_metadata_remain_hidden(caplog):
+    draft = Draft("draft123", [], phase="SYNTHETIC_SECRET")
+    ui = BotUI(BotConfig("dummy", 123, Path("unused")), SimpleNamespace(active=lambda: draft))
+    message = CollectMessage()
+    exc = _diagnostic_http_error("SYNTHETIC_SECRET")
+    exc.__cause__ = RuntimeError("SYNTHETIC_SECRET")
+    asyncio.run(ui._error(SimpleNamespace(effective_message=message), exc))
+    assert "error_code=external_error" in caplog.text
+    assert "phase=None" in caplog.text
+    assert "error category" in message.sent[0][0]
+    assert "SYNTHETIC_SECRET" not in caplog.text + str(message.sent)
+
+
+def test_uncertain_insertion_diagnostics_include_known_phase_and_source_line(caplog):
+    from ym_playlist_maker.service import UncertainWrite
+    draft = Draft("draft123", [Track("Artist", "Song", 17)], phase="writing")
+    ui = BotUI(BotConfig("dummy", 123, Path("unused")), SimpleNamespace(active=lambda: draft))
+    message = CollectMessage()
+    exc = UncertainWrite("The outcome of inserting line 17 is unknown; use /resume")
+    exc.__cause__ = TimeoutError("SYNTHETIC_SECRET")
+    asyncio.run(ui._error(SimpleNamespace(effective_message=message), exc))
+    assert "error_code=uncertain_write phase=writing source_line=17" in caplog.text
+    assert "SYNTHETIC_SECRET" not in caplog.text + str(message.sent)
+
+
+def test_broken_storage_does_not_prevent_actionable_error_notification(caplog):
+    def active():
+        raise RuntimeError("SYNTHETIC_SECRET")
+    ui = BotUI(BotConfig("dummy", 123, Path("unused")), SimpleNamespace(active=active))
+    message = CollectMessage()
+    asyncio.run(ui._error(SimpleNamespace(effective_message=message), MissingCredentials("SYNTHETIC_SECRET")))
+    assert "Repeat authorization" in message.sent[0][0]
+    assert "SYNTHETIC_SECRET" not in caplog.text + str(message.sent)

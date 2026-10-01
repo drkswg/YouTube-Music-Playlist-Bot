@@ -29,6 +29,10 @@ class OAuthCallbackTimeout(OAuthAuthorizationError):
     """The browser did not return to the local OAuth callback server."""
 
 
+class BeforeCreateError(RuntimeError):
+    """The playlist creation request was not dispatched to YouTube."""
+
+
 class BeforeInsertError(RuntimeError):
     """The playlist item request was not dispatched to YouTube."""
 
@@ -136,17 +140,21 @@ class YouTubePlaylists:
                     "or local Python instructions."
                 )
             credentials.refresh(Request())
-            self.token_path.write_text(credentials.to_json(), encoding="utf-8")
+            _save_credentials(credentials, self.token_path)
         return build("youtube", "v3", credentials=credentials, cache_discovery=False)
 
     def check_credentials(self) -> None:
         self._service()
 
     def create_private(self, title: str, marker: str) -> str:
-        response = self._service().playlists().insert(
-            part="snippet,status",
-            body={"snippet": {"title": title, "description": marker}, "status": {"privacyStatus": "private"}},
-        ).execute()
+        try:
+            request = self._service().playlists().insert(
+                part="snippet,status",
+                body={"snippet": {"title": title, "description": marker}, "status": {"privacyStatus": "private"}},
+            )
+        except Exception as exc:
+            raise BeforeCreateError("Could not prepare playlist creation; the request was not sent") from exc
+        response = request.execute()
         return response["id"]
 
     def find_created(self, marker: str) -> list[str]:

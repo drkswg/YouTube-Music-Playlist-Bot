@@ -37,7 +37,8 @@ The workflow follows a persisted sequence: `resolving` → `title` → `confirm`
 2. **Resolve recordings conservatively.** Match the normalized artist credits and base title, then compare recording versions. Featuring labels such as `(feat. Sia)` are artist credits; collaborations such as `David Guetta ft. Sia` require both credited artists. Literal title text such as `Only Girl (In the World)` is preserved, and explicit studio labels identify an ordinary recording. An ordinary request prefers a studio recording over explicitly labelled live, acoustic, remix, instrumental, radio edit, extended, remastered, rerecorded, clean, or explicit versions. A requested version retains its identifying venue, year, or remix name. Unknown or conflicting candidates are excluded individually and do not block a compatible result. One compatible result is selected automatically; several studio releases are selected automatically only when their complete artist credits match and every duration is valid and positive, with a total spread of at most two seconds. Ambiguous releases are offered to optional Gemini selection, or require the owner's choice. All search results participate in the decision; relevant results are ranked before the first five options are shown. A custom search always requires manual selection and keeps the search order.
 3. **Review before writing.** Ask for a playlist title and show the selected recordings, including album and duration when available, before the owner confirms creation.
 4. **Create and populate the playlist.** Create a private playlist, save its ID, and insert selected recordings in input order. Repeated video IDs are skipped. Before the first insertion attempt, wait for playlist availability and retry only `404 playlistNotFound` reads, up to three attempts.
-5. **Recover through reconciliation.** Persist creation and insertion attempts before sending writes. On `/resume`, identify an uncertain playlist creation by its draft marker and compare remote playlist contents with the expected track order before continuing. An absent track after an uncertain insertion requires an explicit retry after the owner checks the playlist; unexpected external changes stop writing.
+5. **Verify completion.** Read the remote playlist again before marking the draft done and require the complete expected order after duplicate skips and definitive rejections. A read failure or external change leaves the draft in writing; /resume checks it without reinserting confirmed tracks.
+6. **Recover through reconciliation.** Persist creation and insertion attempts before sending writes. On `/resume`, identify an uncertain playlist creation by its draft marker and compare remote playlist contents with the expected track order before continuing. An absent track after an uncertain insertion requires an explicit retry after the owner checks the playlist; unexpected external changes stop writing.
 
 The application keeps one active draft, validates buttons against draft IDs and search or insertion revisions, and allows cancellation before creation starts. With an optional Gemini key, fresh ambiguous searches are delegated to Gemini after local identity/version filtering; persisted decisions are never repeated after a restart. Automated tests use fake external services and temporary storage so that workflow recovery can be checked without network access or credentials.
 
@@ -121,13 +122,13 @@ The dependency ranges below are declared in `pyproject.toml`; the Docker image u
 
 4. Open the bot's private chat and send `/start`. The **Menu** button next to the message input opens these commands:
 
-   | Command | Action |
-   |---------|--------|
-   | `/start` | Show how to send a song list |
-   | `/resume` | Continue the saved draft |
-   | `/cancel` | Cancel the draft before playlist creation |
+   | Command               | Action                                                                                                                   |
+   |-----------------------|--------------------------------------------------------------------------------------------------------------------------|
+   | `/start`              | Show how to send a song list                                                                                             |
+   | `/resume`             | Continue the saved draft                                                                                                 |
+   | `/cancel`             | Cancel the draft before playlist creation                                                                                |
    | `/edit <source line>` | Change a selected or skipped recording before creation; add the source line number after selecting `/edit` from the menu |
-   | `/language` | Choose the interface language using buttons; `/language ru` selects Russian directly |
+   | `/language`           | Choose the interface language using buttons; `/language ru` selects Russian directly                                     |
 
    The menu is configured automatically on every bot startup and on `/start`; no BotFather setup is required. Restart a local bot after updating the code, or rebuild the Docker service with `docker compose up --build -d`. If the owner has not opened the chat yet, or Telegram rejects the menu update, the bot logs a warning and keeps running; `/start` retries the setup.
 
@@ -154,6 +155,8 @@ $env:GEMINI_API_KEY = "your-separate-free-project-key"
 .\.venv\Scripts\python.exe -m ym_playlist_maker bot
 ```
 
+The [Gemini API terms](https://ai.google.dev/gemini-api/terms) describe professional or business use, rather than consumer use, and require Paid Services when making API Clients available to users in the EEA, Switzerland or the UK. Assess whether your intended use fits these conditions before enabling this optional feature. The [billing FAQ](https://ai.google.dev/gemini-api/docs/billing) lists Free Tier availability in these regions; tier availability alone does not establish that a particular use is permitted. This bot does not enable billing or verify compliance and billing status. Setting a nonempty GEMINI_API_KEY enables selection automatically; leave it empty if your scenario cannot use the configured free project.
+
 Gemini receives only the requested artist/title and search metadata (titles, artists, albums, durations, eligibility labels, and the local reason for ambiguity). It receives no Telegram identity, playlist title, OAuth credentials, or YouTube video IDs. Metadata sent to a free service is governed by its [terms](https://ai.google.dev/gemini-api/terms); check those before using it.
 
 Confident local matches are still selected immediately. Featuring credits in titles are matched with artist metadata, and every artist explicitly requested through `ft.`, `feat.`, `featuring`, or `&` must be credited. Unknown version qualifiers (for example `Demo` or `Special Version`) and conflicting/incompatible versions are excluded individually. Requested live venues, remix names and years are preserved. An ordinary request cannot switch to labelled live, remix, remastered, rerecorded, clean, explicit or other recognized alternate versions.
@@ -169,6 +172,12 @@ The search snapshot and an attempted-call record are saved before dispatch. Each
 Check the final review carefully: metadata and a model cannot establish audio identity. Use `/edit <source line number>` before creation to reopen the saved options for any selected or skipped song. The original playlist title and track order are retained, the edit is manual, and old creation buttons are invalidated. Custom search and skip remain available. After your choice, the bot returns to review. Editing is unavailable once creation or insertion starts; after a definitive creation rejection such as HTTP 429, retrying creation and editing remain available.
 
 For Docker, add the key to `.env` and run `docker compose up --build -d` to include this code and optional environment configuration. Do not share `docker compose config` output: it can expose both API keys and the Telegram token. For local runs, restart the bot after setting the variable. Validate the integration with a few real ambiguous searches, check the versions, use `/edit`, and then create a private playlist; offline tests cannot verify project billing, actual Gemini availability, model quality, or real Telegram delivery.
+
+## Single Instance and State Backups
+
+Run only one bot process for this owner and state directory. Stop the local process before starting Docker, and stop Docker before starting locally. The in-process lock does not protect against another process using the same SQLite database or account.
+
+To back up state, stop the bot first and copy the runtime directory (including SQLite companion files if present) to a private location. Keep credentials protected and restore only while the bot is stopped. Before using /resume from an older backup, inspect the remote playlists: YouTube writes after the backup are not rolled back by restoring SQLite. Do not blindly create or retry writes from stale state; uncertain creations remain blocked unless the stored marker identifies exactly one playlist. Keep the original current state available until recovery is verified.
 
 ## Running with Docker Compose
 
@@ -246,7 +255,7 @@ If authorization hangs after you grant consent in Google, check whether the brow
 
 Try a list of 2–3 well-known songs, check the selected versions, create a playlist, and open the returned link in **YouTube Music**. Make sure the recordings are visible and that the privacy setting and track order are correct. This combined `ytmusicapi` → official API workflow is not covered by automated tests without your credentials.
 
-If a playlist creation or track insertion request ends without a definitive response, the bot saves its state and reconciles it with YouTube on `/resume`. If the inserted track is found, it continues without adding a duplicate. If the track is absent, the bot displays the **"I checked the playlist; retry insertion"** button. Open the playlist, confirm that the recording is absent, and only then press the button: YouTube sometimes shows changes with a delay, so retrying can still create a duplicate. If the outcome of creating *the playlist itself* is unknown, the bot will not automatically create a second one; check your playlists manually and keep `state.sqlite3` for diagnostics. An authorization or network error **before the insertion request is sent** does not require this button: fix the cause and run `/resume` again. If the quota is exhausted, run `/resume` after it resets.
+If a playlist creation or track insertion request ends without a definitive response, the bot saves its state and reconciles it with YouTube on `/resume`. If the inserted track is found, it continues without adding a duplicate. If the track is absent, the bot displays the **"I checked the playlist; retry insertion"** button. Open the playlist, confirm that the recording is absent, and only then press the button: YouTube sometimes shows changes with a delay, so retrying can still create a duplicate. If the outcome of creating *the playlist itself* is unknown, the bot will not automatically create a second one; check your playlists manually and keep `state.sqlite3` for diagnostics. An authorization or network error **before a creation or insertion request is sent** does not require this button: fix the cause and run `/resume` again. If the quota is exhausted, run `/resume` after it resets.
 
 An OAuth app in **Testing** mode may issue a refresh token that expires after about 7 days; run `auth` again when reauthorization is needed. For ongoing personal use, configure the OAuth app's publishing status according to Google's rules. The standard daily YouTube API quota is limited; playlist creation and each track insertion consume quota separately.
 

@@ -2,17 +2,22 @@
 
 import asyncio
 import logging
+import re
 
 from telegram import BotCommand, BotCommandScopeChat, InlineKeyboardButton, InlineKeyboardMarkup, MenuButtonCommands, Update
 from telegram.constants import ChatType
-from telegram.error import TelegramError
+from telegram.error import BadRequest, NetworkError, TelegramError, TimedOut
+from google.auth.exceptions import RefreshError, TransportError
+from googleapiclient.errors import HttpError
+from requests.exceptions import ConnectionError as RequestsConnectionError, Timeout as RequestsTimeout
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
 from .config import BotConfig
-from .i18n import LANGUAGES, translate, translate_saved_message
+from .i18n import LANGUAGES, translate, translate_saved_message, safe_workflow_message
 from .models import Draft, SelectionRecord, selected_candidate
 from .parser import resolve_candidates
-from .service import PlaylistWorkflow, UnconfirmedInsert, WorkflowError
+from .service import PlaylistWorkflow, UnconfirmedInsert, UncertainWrite, WorkflowError
+from .youtube import MissingCredentials, http_error_reason
 
 log = logging.getLogger(__name__)
 
@@ -61,6 +66,45 @@ def selection_fallback_message(record: SelectionRecord, language: str = "en") ->
     return translate(language, text or "Automatic selection is unavailable.") + " " + translate(language, "Please choose manually.")
 
 
+_EXTERNAL_ERROR_MESSAGES = {
+    "youtube_quota": "YouTube quota or request limits have been reached. Check Google Cloud quotas and use /resume after the limit resets.",
+    "youtube_permissions": "Google authorization lacks the required YouTube permissions. Repeat authorization using the README instructions, then use /resume.",
+    "google_auth": "Google authorization is missing or expired. Repeat authorization using the README instructions, then use /resume.",
+    "network_timeout": "An external service timed out. Check your connection and use /resume to reconcile the saved state.",
+    "network_error": "An external service could not be reached. Check your connection and use /resume to reconcile the saved state.",
+    "external_error": "An external service or internal operation failed. Check the bot logs for the error category.",
+}
+_YOUTUBE_ERROR_CATEGORIES = {
+    "quotaExceeded": "youtube_quota",
+    "dailyLimitExceeded": "youtube_quota",
+    "rateLimitExceeded": "youtube_quota",
+    "userRateLimitExceeded": "youtube_quota",
+    "insufficientPermissions": "youtube_permissions",
+    "authError": "google_auth",
+    "authorizationRequired": "google_auth",
+}
+
+
+def _external_error_category(exc: BaseException | None) -> str:
+    """Allowlist provider categories; never return provider text or raw reasons."""
+    if isinstance(exc, HttpError):
+        category = _YOUTUBE_ERROR_CATEGORIES.get(http_error_reason(exc))
+        if category:
+            return category
+        if exc.resp.status == 401:
+            return "google_auth"
+        if exc.resp.status == 429:
+            return "youtube_quota"
+    if isinstance(exc, (MissingCredentials, RefreshError)):
+        return "google_auth"
+    if isinstance(exc, (TimeoutError, RequestsTimeout, TimedOut)):
+        return "network_timeout"
+    if (isinstance(exc, (ConnectionError, RequestsConnectionError, TransportError))
+            or isinstance(exc, NetworkError) and not isinstance(exc, BadRequest)):
+        return "network_error"
+    return "external_error"
+
+
 class BotUI:
     def __init__(self, config: BotConfig, workflow: PlaylistWorkflow) -> None:
         self.config = config
@@ -105,7 +149,7 @@ class BotUI:
         if self.allowed(update):
             async with self.lock:
                 await self.configure_menu(context.application)
-                await update.effective_message.reply_text(self._t(
+                await self._send_text(update, self._t(
                     "Send a list with one song per line, for example Oasis — Wonderwall. "
                     "Commands: /resume, /cancel, /edit <source line>, /language. Use the Menu button to see all commands."
                 ))
@@ -135,7 +179,7 @@ class BotUI:
         text = self._t("Choose a language. Current language: {language}.", language=LANGUAGES[self.language_code])
         if invalid:
             text = self._t("Unsupported language. Use /language or /language en, ru, es, de, fr, pt.") + "\n" + text
-        await update.effective_message.reply_text(
+        await self._send_text(update,
             text, reply_markup=InlineKeyboardMarkup([buttons[i:i + 2] for i in range(0, len(buttons), 2)]),
         )
 
@@ -144,7 +188,7 @@ class BotUI:
             await asyncio.to_thread(self.store.set_language, code)
         self.language_code = code
         await self.configure_menu(context.application)
-        await update.effective_message.reply_text(self._t(
+        await self._send_text(update, self._t(
             "Language saved: {language}. Use /resume to continue a saved draft or send a song list.",
             language=LANGUAGES[code],
         ))
@@ -155,7 +199,7 @@ class BotUI:
         async with self.lock:
             try:
                 await asyncio.to_thread(self.workflow.cancel)
-                await update.effective_message.reply_text(self._t("Draft cancelled."))
+                await self._send_text(update, self._t("Draft cancelled."))
             except Exception as exc:
                 await self._error(update, exc)
 
@@ -178,7 +222,7 @@ class BotUI:
             try:
                 draft = await asyncio.to_thread(self.workflow.active)
                 if not draft:
-                    await update.effective_message.reply_text(self._t("No draft. Send a list of songs."))
+                    await self._send_text(update, self._t("No draft. Send a list of songs."))
                 elif draft.phase in ("creating", "writing"):
                     draft = await self._publish(update)
                     await self._done(update, draft)
@@ -202,13 +246,13 @@ class BotUI:
                         await asyncio.to_thread(self.workflow.search_again, pending[0], update.effective_message.text)
                         await self._show_state(update)
                     else:
-                        await update.effective_message.reply_text(self._t("First select a version using a button or use /cancel."))
+                        await self._send_text(update, self._t("First select a version using a button or use /cancel."))
                 elif draft and draft.phase in ("confirm", "creating", "writing"):
-                    await update.effective_message.reply_text(self._t("Use the confirmation button or /resume."))
+                    await self._send_text(update, self._t("Use the confirmation button or /resume."))
                 else:
                     _, invalid = await asyncio.to_thread(self.workflow.start, update.effective_message.text)
                     if invalid:
-                        await update.effective_message.reply_text(
+                        await self._send_text(update,
                             self._t("Correct the lines that do not follow the Artist — Song format: {lines}", lines=", ".join(map(str, invalid)))
                         )
                     else:
@@ -220,7 +264,10 @@ class BotUI:
         query = update.callback_query
         if not query:
             return
-        await query.answer()
+        try:
+            await query.answer()
+        except TelegramError as exc:
+            log.warning("Callback acknowledgement failed: error_type=%s", type(exc).__name__)
         if not self.allowed(update):
             return
         async with self.lock:
@@ -244,7 +291,7 @@ class BotUI:
                     await asyncio.to_thread(self.workflow.skip, int(parts[3]), int(parts[4]))
                 elif action == "retry" and len(parts) == 5:
                     await asyncio.to_thread(self.workflow.request_search_again, int(parts[3]), int(parts[4]))
-                    await update.effective_message.reply_text(self._t("Send a new search query for this song."))
+                    await self._send_text(update, self._t("Send a new search query for this song."))
                     return
                 elif action == "create" and len(parts) in (3, 4):
                     expected = int(parts[3]) if len(parts) == 4 else 0
@@ -259,13 +306,13 @@ class BotUI:
                     return
                 elif action == "cancel" and len(parts) == 3:
                     await asyncio.to_thread(self.workflow.cancel)
-                    await update.effective_message.reply_text(self._t("Draft cancelled."))
+                    await self._send_text(update, self._t("Draft cancelled."))
                     return
                 else:
                     raise WorkflowError("Invalid button")
                 await self._show_state(update)
             except (ValueError, IndexError):
-                await update.effective_message.reply_text(self._t("Invalid button; use /resume."))
+                await self._send_text(update, self._t("Invalid button; use /resume."))
             except Exception as exc:
                 await self._error(update, exc)
 
@@ -276,7 +323,7 @@ class BotUI:
             future = None
             notification = None
             try:
-                notification = update.effective_message.reply_text(self._t("The playlist is still being created. Please wait."))
+                notification = self._send_text(update, self._t("The playlist is still being created. Please wait."))
                 future = asyncio.run_coroutine_threadsafe(notification, loop)
                 future.result(timeout=10)
             except Exception:
@@ -284,7 +331,7 @@ class BotUI:
                     future.cancel()
                 elif notification is not None:
                     notification.close()
-                log.warning("Could not send playlist creation progress", exc_info=True)
+                log.warning("Could not send playlist creation progress")
 
         kwargs = {"on_playlist_pending": on_playlist_pending}
         if expected_review_revision is not None:
@@ -300,7 +347,7 @@ class BotUI:
                 notification = None
                 future = None
                 try:
-                    notification = update.effective_message.reply_text(
+                    notification = self._send_text(update,
                         self._t("Gemini is choosing a recording for source line {line} ({total} songs). Please wait.", line=line, total=total)
                     )
                     future = asyncio.run_coroutine_threadsafe(notification, loop)
@@ -317,7 +364,7 @@ class BotUI:
         if draft.phase == "resolving" and index is not None:
             track = draft.tracks[index]
             if track.await_query:
-                await update.effective_message.reply_text(
+                await self._send_text(update,
                     self._t("{index}/{total}: waiting for a new search query for {artist} — {title}.",
                             index=index + 1, total=len(draft.tracks), artist=track.artist, title=track.title)
                 )
@@ -347,12 +394,12 @@ class BotUI:
                 for i, candidate in enumerate(track.candidates[:5], start=1):
                     album = self._t(" · album: {album}", album=candidate.album) if candidate.album else ""
                     duration = f" · {candidate.duration}" if candidate.duration else ""
-                    text += f"\n{i}. {candidate.title} — {', '.join(candidate.artists)}{album}{duration}"[:600]
+                    text += f"\n{i}. {candidate.title} — {', '.join(candidate.artists)}{album}{duration}"
                 if len(track.candidates) > 5:
                     text += "\n" + self._t("Showing 5 of {total} results; {hidden} more are hidden. Try another search to narrow the results.", total=len(track.candidates), hidden=len(track.candidates) - 5)
-            await update.effective_message.reply_text(text, reply_markup=InlineKeyboardMarkup(rows))
+            await self._send_text(update, text, reply_markup=InlineKeyboardMarkup(rows))
         elif draft.phase == "title":
-            await update.effective_message.reply_text(self._t("Selection complete. Send a title for the new playlist."))
+            await self._send_text(update, self._t("Selection complete. Send a title for the new playlist."))
         elif draft.phase == "confirm":
             selected = [t for t in draft.tracks if t.status == "selected"]
             skipped = [t.source_line for t in draft.tracks if t.status == "skipped"]
@@ -370,7 +417,7 @@ class BotUI:
                 if candidate.video_id in seen:
                     detail += self._t(" · duplicate will be skipped")
                 seen.add(candidate.video_id)
-                lines.append(detail[:700])
+                lines.append(detail)
             if skipped:
                 lines.append(self._t("Skipped lines: {lines}", lines=", ".join(map(str, skipped))))
             await self._send_lines(update, [self._t("{title}: selected recordings", title=draft.title)] + lines)
@@ -380,54 +427,105 @@ class BotUI:
                 InlineKeyboardButton(self._t("Cancel"), callback_data=base + "cancel"),
             ]]
             summary = self._t("Reviewed {count} selected entries. Use /edit <source line> to change a recording. Create a private playlist?", count=len(selected))
-            await update.effective_message.reply_text(summary, reply_markup=InlineKeyboardMarkup(rows))
+            await self._send_text(update, summary, reply_markup=InlineKeyboardMarkup(rows))
         elif draft.phase == "done":
             await self._done(update, draft)
 
     async def _done(self, update: Update, draft) -> None:
         if draft.phase != "done":
-            await update.effective_message.reply_text(self._t("Writing is not complete yet. Use /resume."))
+            await self._send_text(update, self._t("Writing is not complete yet. Use /resume."))
             return
         added = sum(t.status == "added" for t in draft.tracks)
         message = self._t("Done: {added} songs. {url}", added=added, url=f"https://music.youtube.com/playlist?list={draft.playlist_id}")
         if draft.errors:
-            message += "\n" + "\n".join(translate_saved_message(self.language_code, error) for error in draft.errors)
-        await update.effective_message.reply_text(message[:4000])
+            message += "\n" + "\n".join((translate_saved_message(self.language_code, error) if safe_workflow_message(error)
+                                      else self._t("An external service or internal operation failed. Check the bot logs for the error category."))
+                                     for error in draft.errors)
+        await self._send_text(update, message)
 
     async def _send_lines(self, update: Update, lines: list[str]) -> None:
-        chunk = ""
-        for line in lines:
-            line = line[:3000]
-            if chunk and len(chunk) + len(line) + 1 > 3500:
-                await update.effective_message.reply_text(chunk)
-                chunk = ""
-            chunk += ("\n" if chunk else "") + line
-        if chunk:
-            await update.effective_message.reply_text(chunk)
+        await self._send_text(update, "\n".join(lines))
 
-    async def _error(self, update: Update, exc: Exception) -> None:
-        log.exception("Workflow failed", exc_info=exc)
-        detail = translate_saved_message(self.language_code, str(exc)) if isinstance(exc, WorkflowError) else f"{type(exc).__name__}: {exc}"
+    async def _send_text(self, update: Update, text: str, *, reply_markup: InlineKeyboardMarkup | None = None) -> None:
+        # Bound conservatively in UTF-16 units; astral characters count as two.
+        chunks: list[str] = []
+        remaining = text
+        while remaining:
+            units = 0
+            end = 0
+            for char in remaining:
+                width = 2 if ord(char) > 0xFFFF else 1
+                if units + width > 3500:
+                    break
+                units += width
+                end += 1
+            split = end
+            if end < len(remaining):
+                newline = remaining.rfind("\n", 0, end)
+                if newline > 0:
+                    split = newline + 1
+            chunks.append(remaining[:split])
+            remaining = remaining[split:]
+        for index, chunk in enumerate(chunks):
+            kwargs = {"reply_markup": reply_markup} if reply_markup is not None and index == len(chunks) - 1 else {}
+            await update.effective_message.reply_text(chunk, **kwargs)
+
+    async def error_handler(self, update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+        # Never log provider text, updates, tracebacks or chained exceptions.
+        exc = context.error
+        log.error("Unhandled bot error: error_type=%s", type(exc).__name__)
+        if isinstance(update, Update) and self.allowed(update) and update.effective_message:
+            try:
+                await self._error(update, exc)
+            except Exception as send_exc:
+                log.warning("Could not send error notification: error_type=%s", type(send_exc).__name__)
+
+    async def _error(self, update: Update, exc: BaseException | None) -> None:
+        status = getattr(getattr(exc, "resp", None), "status", None)
+        status = status if isinstance(status, int) and 100 <= status <= 599 else None
+        category = _external_error_category(exc)
+        draft = None
+        try:
+            if self.workflow is not None:
+                draft = await asyncio.to_thread(self.workflow.active)
+        except Exception:
+            pass  # Broken storage must not prevent a safe error notification.
+        phase = draft.phase if draft and draft.phase in ("resolving", "title", "confirm", "creating", "writing", "done") else None
+        source_line = None
+        if isinstance(exc, UnconfirmedInsert) and draft and 0 <= exc.index < len(draft.tracks):
+            source_line = draft.tracks[exc.index].source_line
+        if not isinstance(source_line, int) or source_line <= 0:
+            source_line = None
+        known_workflow = isinstance(exc, WorkflowError) and safe_workflow_message(str(exc))
+        if known_workflow:
+            if source_line is None and (match := re.search(r"(?:Line|line) (\d+)", str(exc))):
+                source_line = int(match.group(1))
+            category = ("unconfirmed_insert" if isinstance(exc, UnconfirmedInsert)
+                        else "uncertain_write" if isinstance(exc, UncertainWrite) else "workflow_error")
+        log.error("Workflow failed: error_type=%s http_status=%s error_code=%s phase=%s source_line=%s",
+                  type(exc).__name__, status, category, phase, source_line)
+        detail = (translate_saved_message(self.language_code, str(exc)) if known_workflow
+                  else self._t(_EXTERNAL_ERROR_MESSAGES[category]))
         if isinstance(exc, UnconfirmedInsert):
-            draft = await asyncio.to_thread(self.workflow.active)
             if draft:
                 button = InlineKeyboardButton(
                     self._t("I checked the playlist; retry insertion"),
                     callback_data=f"d:{draft.draft_id}:retryinsert:{exc.index}:{exc.revision}",
                 )
-                await update.effective_message.reply_text(
+                await self._send_text(update,
                     self._t("The outcome of the previous insertion is unknown. Open the playlist and make sure "
                     "this recording is absent. Retrying may create a duplicate if YouTube shows the recording later.\n"
                     ) + detail,
                     reply_markup=InlineKeyboardMarkup([[button]]),
                 )
                 return
-        await update.effective_message.reply_text(self._t("Error: {detail}\nUse /resume to continue.", detail=detail)[:4000])
+        await self._send_text(update, self._t("Error: {detail}\nUse /resume to continue.", detail=detail))
 
 
 def build_application(config: BotConfig, workflow: PlaylistWorkflow) -> Application:
     ui = BotUI(config, workflow)
     app = Application.builder().token(config.token).post_init(ui.configure_menu).build()
+    app.add_error_handler(ui.error_handler)
     app.add_handler(CommandHandler("start", ui.start))
     app.add_handler(CommandHandler("cancel", ui.cancel))
     app.add_handler(CommandHandler("resume", ui.resume))

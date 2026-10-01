@@ -161,12 +161,16 @@ def _title_recording(title: str) -> _Recording:
                       tuple(sorted(featured)), _subtitle_bases(base))
 
 
-def _album_versions(album: str) -> tuple[tuple[str, str], ...]:
+def _album_recording(album: str) -> _Recording:
     if re.fullmatch(r"(?:\d{4} )?remaster(?:ed)?(?: \d{4})?(?: edition)?", normalized(album)):
-        return _version(album)
+        return _Recording(normalized(album), _version(album))
+    value = normalized(album)
+    if value in {"demo", "special version", "mono", "stereo", "bonus", "bonus edition"}:
+        return _Recording(value, unknown=True)
+    if value in {"original", "original version", "studio", "studio version", "studio recording"}:
+        return _Recording(value, explicit_studio=True)
     parsed = _title_recording(album)
     versions = list(parsed.versions)
-    value = normalized(album)
     # A bare label or an explicit "Live at ..." describes a recording. An
     # album such as "Live Through This" does not.
     if not versions and (
@@ -176,14 +180,16 @@ def _album_versions(album: str) -> tuple[tuple[str, str], ...]:
         or re.fullmatch(r"(?:\d{4} )?remaster(?:ed)?(?: \d{4})?(?: edition)?", value)
     ):
         versions.extend(_version(album))
-    return tuple(versions)
+    return _Recording(parsed.base, tuple(versions), parsed.unknown, parsed.explicit_studio)
 
 
 def _candidate_recording(candidate: Candidate) -> _Recording:
     title = _title_recording(candidate.title)
-    album = _album_versions(candidate.album)
+    album_recording = _album_recording(candidate.album)
+    album = album_recording.versions
     by_kind: dict[str, str] = dict(title.versions)
-    conflict = title.unknown or bool(title.explicit_studio and (title.versions or album))
+    conflict = (title.unknown or album_recording.unknown
+                or bool((title.explicit_studio or album_recording.explicit_studio) and (title.versions or album)))
     if len(by_kind) != len(title.versions):
         conflict = True
     # Different kinds in title/album, or conflicting details of one kind, are
