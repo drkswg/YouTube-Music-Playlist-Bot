@@ -10,7 +10,7 @@ Use `/language` to choose English, Russian, Spanish, German, French, or Portugue
 
 ## Architecture
 
-The application runs as a single process with separate layers for Telegram interaction, workflow rules, external services, and persistence. `__main__.py` reads configuration and connects these components for the `bot` command; the `auth` command performs local Google OAuth authorization.
+The application runs as a single process with separate layers for Telegram interaction, workflow rules, external services, and persistence. `__main__.py` reads configuration and connects these components for the `bot` command; the `auth` command performs Google OAuth authorization either locally or in a one-off container, with consent in the host browser.
 
 ```mermaid
 flowchart TD
@@ -49,7 +49,8 @@ ym_playlist_maker/
 ├── pyproject.toml               # Package metadata, dependencies, and pytest settings
 ├── Dockerfile                   # Python 3.12 container image
 ├── compose.yaml                 # Bot service, environment, and data bind mount
-├── .env.example                 # Example Telegram configuration
+├── compose.auth.yaml            # One-off OAuth service and local callback port
+├── .env.example                 # Example Telegram, OAuth, and Gemini configuration
 ├── .gitignore                   # Local state, secrets, and generated file exclusions
 ├── .dockerignore                # Container build context exclusions
 ├── AGENTS.md                    # Local repository guidelines
@@ -92,18 +93,18 @@ The dependency ranges below are declared in `pyproject.toml`; the Docker image u
 | Telegram interface | `python-telegram-bot`      | `>=22.0,<23`; asynchronous handlers and long polling                     |
 | Music search       | `ytmusicapi`               | `>=1.10,<2`; unauthenticated YouTube Music song search                   |
 | Playlist API       | `google-api-python-client` | `>=2.0,<3`; YouTube Data API v3                                          |
-| Authorization      | `google-auth-oauthlib`     | `>=1.3,<2`; Google OAuth Desktop app flow and locally stored credentials |
+| Authorization      | `google-auth-oauthlib`     | `>=1.3,<2`; Google OAuth Desktop app flow with a loopback callback       |
 | Persistence        | SQLite and JSON            | Python standard library `sqlite3` and `json`                             |
 | Concurrency        | `asyncio`                  | Python standard library; serialized actions and worker threads           |
 | Packaging          | setuptools and pip         | `setuptools>=70`; `src/` package layout and editable installation        |
 | Testing            | pytest                     | `>=8,<10`; optional `test` dependency group                              |
-| Deployment         | Docker and Docker Compose  | `python:3.12-slim`; one bot service with a persistent data bind mount    |
+| Deployment         | Docker and Docker Compose  | `python:3.12-slim`; bot and one-off auth share an image and data mount   |
 
 ## Setup
 
-1. Install Python 3.12 and create a bot through `@BotFather`. Save the bot token and the owner's **numeric** Telegram user ID. The bot only accepts messages from this ID in a private chat.
+1. Create a bot through `@BotFather`. Save the bot token and the owner's **numeric** Telegram user ID. The bot only accepts messages from this ID in a private chat.
 2. In [Google Cloud Console](https://console.cloud.google.com/), create a project, enable **YouTube Data API v3**, configure the OAuth consent screen, and create an OAuth client of type **Desktop app**. Download the client JSON to a private location outside the repository. Add your Google account to the test users if the OAuth app is in Testing mode.
-3. To run without Docker, open PowerShell in the project directory:
+3. Choose how to run the application. **Docker needs no Python installation on the computer**: follow [Running with Docker Compose](#running-with-docker-compose) for containerized preparation, authorization, and startup. For a local run without Docker, install Python 3.12 and open PowerShell in the project directory:
 
    ```powershell
    py -3.12 -m venv .venv
@@ -115,6 +116,8 @@ The dependency ranges below are declared in `pyproject.toml`; the Docker image u
    ```
 
    The `auth` command opens your default browser and saves the Google OAuth token to `%LOCALAPPDATA%\ym_playlist_maker\token.json`. The bot also stores `state.sqlite3` there. These files contain sensitive data: restrict directory access to your Windows user and do not copy the token into the repository. To use a different directory, set `YM_DATA_DIR` before running both commands.
+
+   Local `auth` defaults to a free port on `127.0.0.1` and opens the browser automatically. `--no-browser` prints the link for you to open yourself; `--port` chooses a callback port and `--bind-address` changes the listening interface. The Google redirect address remains `127.0.0.1`. When listening on another interface, a fixed nonzero port is required.
 
 4. Open the bot's private chat and send `/start`. The **Menu** button next to the message input opens these commands:
 
@@ -169,32 +172,75 @@ For Docker, add the key to `.env` and run `docker compose up --build -d` to incl
 
 ## Running with Docker Compose
 
-Install Docker with Compose. Complete OAuth authorization once on the Windows host: it opens a browser and uses a temporary local port. From the project directory in PowerShell:
+Install Docker with Compose (for example, Docker Desktop using Linux containers on Windows). **Python, pip, and a virtual environment are not needed on the host.** The image installs Python 3.12 and application dependencies; Google authorization runs in a separate one-off container. Account creation, downloading the OAuth Desktop client JSON, and approving Google access use the host browser as described in Setup.
+
+From the project directory in PowerShell:
 
 ```powershell
 if (-not (Test-Path .env)) { Copy-Item .env.example .env }
 notepad .env
 ```
 
-Enter your actual `TELEGRAM_BOT_TOKEN` and numeric `TELEGRAM_OWNER_ID`, then save the file. Next:
+Enter your actual `TELEGRAM_BOT_TOKEN` and numeric `TELEGRAM_OWNER_ID`. Set `GOOGLE_CLIENT_SECRETS` to the absolute path of your downloaded OAuth **Desktop app** JSON outside the repository. On Windows use forward slashes and quote the path, for example:
+
+```dotenv
+GOOGLE_CLIENT_SECRETS="C:/Users/your-user/private/desktop-client.json"
+YM_AUTH_PORT=8080
+```
+
+`YM_AUTH_PORT` is optional and defaults to `8080`; choose another port from `1` to `65535` if it is busy. Save `.env`, stop any running instance of the bot before authorizing, and run:
 
 ```powershell
-py -3.12 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -e .
-New-Item -ItemType Directory -Force .\data | Out-Null
-$env:YM_DATA_DIR = (Resolve-Path .\data).Path
-.\.venv\Scripts\python.exe -m ym_playlist_maker auth --client-secrets C:\path\to\desktop-client.json
-docker compose up --build -d
+$authJson = docker compose -f compose.auth.yaml config --format json
+if ($LASTEXITCODE -ne 0) { throw "Check the OAuth settings in .env" }
+$authConfig = $authJson | ConvertFrom-Json
+$clientMount = $authConfig.services.auth.volumes | Where-Object target -eq '/run/secrets/google-client.json'
+if (-not (Test-Path -LiteralPath $clientMount.source -PathType Leaf)) {
+    throw "OAuth client JSON file not found: $($clientMount.source)"
+} else {
+    docker compose -f compose.auth.yaml run --rm --build --service-ports auth
+}
+```
+
+Open the printed Google authorization link in a browser **on this computer**, grant access, and wait for the command to finish successfully. The browser returns to `http://127.0.0.1:8080/` (or your chosen port). The container handles the callback, exchanges the code, and saves `data/token.json`. Then start the bot:
+
+```powershell
+docker compose up --build -d bot
 docker compose logs -f bot
 ```
 
-After authorization, `data/token.json` is available to the container through a bind mount; `state.sqlite3` is saved in the same directory. The `data/` directory and `.env` file are excluded from Git and the image build context. Restrict access to yourself and do not publish the output of `docker compose config`, which exposes configured API keys and the Telegram token. No ports need to be exposed: the bot receives messages through long polling.
+Both services use the same `ym-playlist-maker:local` image and `data/` bind mount; Compose creates the directory if it is missing. `state.sqlite3` is saved there by the bot. The authorization service belongs to a separate Compose project, does not start the bot, and does not receive Telegram or Gemini keys. It mounts the client JSON read-only with `create_host_path: false`; the application rejects missing files and directories.
+
+The PowerShell check before `compose run` is important on Windows: some Docker Desktop versions create a directory for a missing bind source even with `create_host_path: false` ([reported Compose issue](https://github.com/docker/compose/issues/13602)). Checking the resolved file path before creating the container avoids this. The check uses built-in PowerShell commands and only reads the auth configuration, which contains no Telegram or Gemini keys. Python and all OAuth processing stay in the container.
+
+The callback is published only on the host's `127.0.0.1`, using the same port inside and outside the auth container. `--service-ports` is required because `compose run` normally omits published ports. `--rm` removes the one-off container and its port mapping after it exits. The bot itself publishes no ports and receives messages through long polling.
+
+The `data/` directory and `.env` file are excluded from Git and the image build context; keep the client JSON outside the repository. Restrict access to yourself and do not publish the output of `docker compose config`, which exposes configured API keys and the Telegram token. Authorization does not replace an existing token until the new credentials have been saved successfully.
 
 If the bot has already run locally, stop the local process and copy `%LOCALAPPDATA%\ym_playlist_maker\token.json` to `data/token.json` instead of running `auth` again. If there is an unfinished draft, also move `state.sqlite3` to `data/`.
 
-For subsequent runs, use `docker compose up -d`; stop the bot with `docker compose down`. If Google authorization needs to be renewed, run the local `auth` command with the same `YM_DATA_DIR`, then run `docker compose restart bot`.
+For subsequent runs, use `docker compose up -d bot`; stop the bot with `docker compose down`. A saved token is sufficient: the bot does not need the OAuth client JSON, `GOOGLE_CLIENT_SECRETS`, or `YM_AUTH_PORT`.
 
-If authorization hangs after you grant consent in Google, check whether the browser opened `http://127.0.0.1:<port>/` with a completion message. The command waits up to five minutes for this local redirect; if it does not arrive, check whether the browser, VPN, proxy, or security software is blocking the address. The `auth` command requires an OAuth client JSON of type **Desktop app**. Do not share the full redirect URL with anyone: it contains a one-time authorization code.
+If Google authorization needs to be renewed, stop the bot before running the auth container so that both processes cannot overwrite the token concurrently:
+
+```powershell
+docker compose stop bot
+$authJson = docker compose -f compose.auth.yaml config --format json
+if ($LASTEXITCODE -ne 0) { throw "Check the OAuth settings in .env" }
+$authConfig = $authJson | ConvertFrom-Json
+$clientMount = $authConfig.services.auth.volumes | Where-Object target -eq '/run/secrets/google-client.json'
+if (-not (Test-Path -LiteralPath $clientMount.source -PathType Leaf)) {
+    throw "OAuth client JSON file not found: $($clientMount.source)"
+} else {
+    docker compose -f compose.auth.yaml run --rm --build --service-ports auth
+}
+# After authorization succeeds:
+docker compose up -d bot
+```
+
+If authorization fails or is cancelled, the previous token and saved draft remain intact. Correct the issue and rerun auth before starting the bot again. No token or database format migration is required.
+
+If authorization hangs after you grant consent in Google, check whether the browser opened `http://127.0.0.1:<port>/` with a completion message. The command waits up to five minutes for this local redirect; if it does not arrive, check that you used `--service-ports` and that the browser, VPN, proxy, or security software is not blocking the address. If Docker reports that the port is occupied, change `YM_AUTH_PORT` in `.env` and rerun the command; the callback and port mapping update together. A missing or unreadable client JSON, a non-Desktop client, or a rejected authorization causes a nonzero exit. Do not share the full redirect URL with anyone: it contains a one-time authorization code.
 
 ## Verifying the Integration Before Regular Use
 
@@ -206,7 +252,18 @@ An OAuth app in **Testing** mode may issue a refresh token that expires after ab
 
 Before the first playlist contents check, the bot waits one second for the new playlist to become available. If YouTube returns `404 playlistNotFound`, it reports that the playlist is still being created and retries the check, waiting one second before each attempt (three attempts total). After the third failure, it shows the usual error; `/resume` checks the same saved playlist again without creating another one. These automatic retries apply only before any track insertion has been attempted.
 
-## Local Tests
+## Tests
+
+To run the offline suite without installing Python on the host, build the application image and run tests in a disposable container. Test dependencies are installed only in this container; mount the tests read-only:
+
+```powershell
+docker build -t ym-playlist-maker:local .
+docker run --rm --mount "type=bind,source=$($PWD.Path)/tests,target=/tests,readonly" ym-playlist-maker:local sh -c 'python -m pip install --no-cache-dir ".[test]" && python -m pytest -q -p no:cacheprovider /tests'
+```
+
+Image building and installing test dependencies need network access; the tests themselves do not contact external services or use real secrets. The runtime `data/` directory and `.env` are not mounted in the test container.
+
+For local development with the Python environment from Setup:
 
 ```powershell
 .\.venv\Scripts\python.exe -m pytest -q
