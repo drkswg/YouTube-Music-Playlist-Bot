@@ -64,6 +64,7 @@ class Draft:
     create_marker: str = ""
     errors: list[str] = field(default_factory=list)
     review_revision: int = 0
+    privacy: Literal["private", "public"] = "private"
 
     def to_dict(self) -> dict:
         return asdict(self)

@@ -16,6 +16,8 @@ from ym_playlist_maker.models import Candidate, Draft, Track
 from ym_playlist_maker.service import UnconfirmedInsert
 from ym_playlist_maker.youtube import BeforeInsertError, MissingCredentials, YouTubePlaylists
 
+from test_workflow import FakeSearch, FakeYouTube, prepare
+
 
 class FakeCollection:
     def __init__(self, response):
@@ -46,21 +48,30 @@ class FakeService:
         return self.item_collection
 
 
-def test_youtube_write_bodies_are_private_and_use_video_ids():
+@pytest.mark.parametrize("privacy", ["private", "public"])
+def test_youtube_write_bodies_use_chosen_privacy_and_video_ids(privacy):
     adapter = YouTubePlaylists(Path("unused"))
     fake = FakeService()
     adapter._service = lambda: fake
-    assert adapter.create_private("Title", "marker") == "PL123"
+    assert adapter.create_playlist("Title", "marker", privacy) == "PL123"
     assert fake.playlist_collection.calls[0] == (
         "insert", {"part": "snippet,status", "body": {
             "snippet": {"title": "Title", "description": "marker"},
-            "status": {"privacyStatus": "private"},
+            "status": {"privacyStatus": privacy},
         }}
     )
     adapter.add("PL123", "video123")
     assert fake.item_collection.calls[0][1]["body"]["snippet"]["resourceId"] == {
         "kind": "youtube#video", "videoId": "video123"
     }
+
+
+@pytest.mark.parametrize("privacy", ["unlisted", ""])
+def test_youtube_rejects_unsupported_privacy_before_preparing_request(privacy):
+    adapter = YouTubePlaylists(Path("unused"))
+    adapter._service = lambda: pytest.fail("Invalid privacy reached request preparation")
+    with pytest.raises(ValueError, match="^Playlist privacy must be private or public$"):
+        adapter.create_playlist("Title", "marker", privacy)
 
 
 def test_youtube_preparation_failure_is_marked_not_dispatched():
@@ -260,6 +271,100 @@ def test_confirmation_lists_every_selection_in_telegram_safe_chunks():
     assert message.sent[-1][1]["reply_markup"]
 
 
+@pytest.fixture
+def review_ui(tmp_path, monkeypatch):
+    from ym_playlist_maker.service import PlaylistWorkflow
+    from ym_playlist_maker.store import DraftStore
+
+    monkeypatch.setattr("ym_playlist_maker.service.sleep", lambda _: None)
+    store = DraftStore(tmp_path / "state.sqlite3")
+    youtube = FakeYouTube()
+    workflow = PlaylistWorkflow(store, FakeSearch(), youtube)
+    prepare(workflow)
+    ui = BotUI(BotConfig("dummy", 123, Path("unused")), workflow)
+    yield ui, youtube, store
+    store.close()
+
+
+def review_update(data=None):
+    return SimpleNamespace(
+        effective_user=SimpleNamespace(id=123),
+        effective_chat=SimpleNamespace(type=ChatType.PRIVATE),
+        effective_message=CollectMessage(),
+        callback_query=SimpleNamespace(data=data, answer=AsyncMock()) if data is not None else None,
+    )
+
+
+@pytest.mark.parametrize("privacy", ["private", "public"])
+def test_review_buttons_publish_chosen_privacy_once(review_ui, privacy):
+    ui, youtube, store = review_ui
+    update = review_update()
+    asyncio.run(ui.resume(update, None))
+    rows = update.effective_message.sent[-1][1]["reply_markup"].inline_keyboard
+    assert [len(row) for row in rows] == [1, 1, 1]
+    buttons = {row[0].text: row[0].callback_data for row in rows}
+    action = f"Create {privacy} playlist"
+    callback = review_update(buttons[action])
+    asyncio.run(ui.callback(callback, None))
+    saved = store.load()
+    assert saved.phase == "done" and saved.privacy == privacy
+    assert youtube.created == [("playlist1", saved.title, saved.create_marker, privacy)]
+    assert youtube.items == ["oasis", "numb1"]
+    assert "Done: 2 songs. https://music.youtube.com/playlist?list=playlist1" in callback.effective_message.sent[-1][0]
+    opposite = "public" if privacy == "private" else "private"
+    old = review_update(buttons[f"Create {opposite} playlist"])
+    calls = (youtube.created.copy(), youtube.items.copy(), youtube.item_reads)
+    asyncio.run(ui.callback(old, None))
+    assert "This review is outdated" in old.effective_message.sent[-1][0]
+    assert store.load().to_dict() == saved.to_dict()
+    assert (youtube.created, youtube.items, youtube.item_reads) == calls
+
+
+@pytest.mark.parametrize("template,error", [
+    ("d:{draft_id}:create", "This review is outdated"),
+    ("d:{draft_id}:create:0", "This review is outdated"),
+    ("d:{draft_id}:create:garbage", "This review is outdated"),
+    ("d:{draft_id}:create:0:unlisted", "Invalid button"),
+    ("d:{draft_id}:create:0:", "Invalid button"),
+    ("d:{draft_id}:create::public", "Invalid button"),
+    ("d:{draft_id}:create:invalid:private", "Invalid button"),
+    ("d:{draft_id}:create:0:public:extra", "Invalid button"),
+    ("d:{draft_id}", "Invalid button"),
+    ("d:wrong-draft:create:0:public", "This button belongs to an old draft"),
+])
+def test_invalid_create_callbacks_never_mutate_draft(review_ui, template, error):
+    ui, youtube, store = review_ui
+    saved = store.load().to_dict()
+    update = review_update(template.format(draft_id=saved["draft_id"]))
+    asyncio.run(ui.callback(update, None))
+    assert error in update.effective_message.sent[-1][0]
+    assert store.load().to_dict() == saved
+    assert youtube.created == [] and youtube.items == [] and youtube.item_reads == 0
+
+
+@pytest.mark.parametrize("privacy", ["private", "public"])
+def test_create_callbacks_are_stale_during_and_after_edit(review_ui, privacy):
+    ui, youtube, store = review_ui
+    review = review_update()
+    asyncio.run(ui.resume(review, None))
+    rows = review.effective_message.sent[-1][1]["reply_markup"].inline_keyboard
+    callback_data = rows[privacy == "public"][0].callback_data
+    edit = review_update()
+    asyncio.run(ui.edit(edit, SimpleNamespace(args=["2"])))
+    assert store.load().phase == "resolving"
+    pick_rows = edit.effective_message.sent[-1][1]["reply_markup"].inline_keyboard
+    for resolved in (False, True):
+        if resolved:
+            asyncio.run(ui.callback(review_update(pick_rows[0][0].callback_data), None))
+            assert store.load().phase == "confirm"
+        saved = store.load().to_dict()
+        update = review_update(callback_data)
+        asyncio.run(ui.callback(update, None))
+        assert "This review is outdated" in update.effective_message.sent[-1][0]
+        assert store.load().to_dict() == saved
+        assert youtube.created == [] and youtube.items == [] and youtube.item_reads == 0
+
+
 def test_unconfirmed_insert_shows_explicit_retry_button():
     draft = Draft("draft123", [Track("A", "B", 1, status="uncertain", selected="id")], phase="writing", playlist_id="PL123")
     workflow = SimpleNamespace(active=lambda: draft)
@@ -271,12 +376,12 @@ def test_unconfirmed_insert_shows_explicit_retry_button():
     assert button.callback_data == "d:draft123:retryinsert:0:2"
 
 
-@pytest.mark.parametrize("entry", ["create", "resume"])
+@pytest.mark.parametrize("entry", ["private", "public", "resume"])
 @pytest.mark.parametrize("failed", [False, True])
 def test_publish_ui_delivers_progress_on_loop_before_result(entry, failed):
     events = []
     draft = Draft("draft123", [Track("A", "B", 1, status="selected", selected="id")],
-                  phase="confirm" if entry == "create" else "writing", playlist_id="PL123")
+                  phase="writing" if entry == "resume" else "confirm", playlist_id="PL123")
 
     async def run():
         loop = asyncio.get_running_loop()
@@ -289,7 +394,9 @@ def test_publish_ui_delivers_progress_on_loop_before_result(entry, failed):
                 await asyncio.sleep(0)
                 events.append(text)
 
-        def publish(*, on_playlist_pending=None):
+        def publish(*, on_playlist_pending=None, privacy=None, expected_review_revision=None):
+            assert privacy == (None if entry == "resume" else entry)
+            assert expected_review_revision == (None if entry == "resume" else draft.review_revision)
             assert threading.get_ident() != loop_thread
             for attempt in range(3 if failed else 2):
                 events.append(f"read {attempt + 1}")
@@ -309,9 +416,9 @@ def test_publish_ui_delivers_progress_on_loop_before_result(entry, failed):
 
         update = SimpleNamespace(
             effective_user=SimpleNamespace(id=123), effective_chat=SimpleNamespace(type=ChatType.PRIVATE),
-            effective_message=Message(), callback_query=SimpleNamespace(data="d:draft123:create", answer=answer),
+            effective_message=Message(), callback_query=SimpleNamespace(data=f"d:draft123:create:0:{entry}", answer=answer),
         )
-        if entry == "create":
+        if entry != "resume":
             await ui.callback(update, None)
         else:
             await ui.resume(update, None)
@@ -404,7 +511,7 @@ def test_creation_boundary_distinguishes_prepare_from_dispatch(boundary):
             fake.playlist_collection.execute = fail
     expected = TimeoutError if boundary == "dispatch" else BeforeCreateError
     with pytest.raises(expected):
-        adapter.create_private("Title", "marker")
+        adapter.create_playlist("Title", "marker", "private")
     assert calls == [boundary]
 
 

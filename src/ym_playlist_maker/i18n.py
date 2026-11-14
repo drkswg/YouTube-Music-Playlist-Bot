@@ -174,13 +174,17 @@ _CATALOG: dict[str, tuple[str, ...]] = {
         "Создать приватный плейлист", "Crear lista privada", "Private Playlist erstellen",
         "Créer une playlist privée", "Criar playlist privada",
     ),
+    "Create public playlist": (
+        "Создать публичный плейлист", "Crear lista pública", "Öffentliche Playlist erstellen",
+        "Créer une playlist publique", "Criar playlist pública",
+    ),
     "Cancel": ("Отмена", "Cancelar", "Abbrechen", "Annuler", "Cancelar"),
-    "Reviewed {count} selected entries. Use /edit <source line> to change a recording. Create a private playlist?": (
-        "Выбрано записей: {count}. Для изменения записи используйте /edit <номер строки>. Создать приватный плейлист?",
-        "Se revisaron {count} entradas seleccionadas. Usa /edit <número de línea> para cambiar una grabación. ¿Crear una lista privada?",
-        "{count} ausgewählte Einträge geprüft. Ändere eine Aufnahme mit /edit <Zeilennummer>. Private Playlist erstellen?",
-        "{count} entrées sélectionnées vérifiées. Utilisez /edit <numéro de ligne> pour changer un enregistrement. Créer une playlist privée ?",
-        "{count} entradas selecionadas revisadas. Use /edit <número da linha> para alterar uma gravação. Criar uma playlist privada?",
+    "Reviewed {count} selected entries. Use /edit <source line> to change a recording. Create a private or public playlist?": (
+        "Выбрано записей: {count}. Для изменения записи используйте /edit <номер строки>. Создать приватный или публичный плейлист?",
+        "Se revisaron {count} entradas seleccionadas. Usa /edit <número de línea> para cambiar una grabación. ¿Crear una lista privada o pública?",
+        "{count} ausgewählte Einträge geprüft. Ändere eine Aufnahme mit /edit <Zeilennummer>. Eine private oder öffentliche Playlist erstellen?",
+        "{count} entrées sélectionnées vérifiées. Utilisez /edit <numéro de ligne> pour changer un enregistrement. Créer une playlist privée ou publique ?",
+        "{count} entradas selecionadas revisadas. Use /edit <número da linha> para alterar uma gravação. Criar uma playlist privada ou pública?",
     ),
     "Writing is not complete yet. Use /resume.": (
         "Добавление песен ещё не завершено. Используйте /resume.", "La escritura aún no ha terminado. Usa /resume.",

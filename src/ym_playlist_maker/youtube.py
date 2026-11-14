@@ -5,6 +5,7 @@ import json
 import tempfile
 import webbrowser
 from pathlib import Path
+from typing import Literal
 
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -146,11 +147,13 @@ class YouTubePlaylists:
     def check_credentials(self) -> None:
         self._service()
 
-    def create_private(self, title: str, marker: str) -> str:
+    def create_playlist(self, title: str, marker: str, privacy: Literal["private", "public"]) -> str:
+        if privacy not in ("private", "public"):
+            raise ValueError("Playlist privacy must be private or public")
         try:
             request = self._service().playlists().insert(
                 part="snippet,status",
-                body={"snippet": {"title": title, "description": marker}, "status": {"privacyStatus": "private"}},
+                body={"snippet": {"title": title, "description": marker}, "status": {"privacyStatus": privacy}},
             )
         except Exception as exc:
             raise BeforeCreateError("Could not prepare playlist creation; the request was not sent") from exc

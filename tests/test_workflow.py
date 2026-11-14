@@ -1,3 +1,5 @@
+import json
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -7,7 +9,7 @@ from httplib2 import Response
 from ym_playlist_maker.models import Candidate
 from ym_playlist_maker.service import PlaylistWorkflow, UnconfirmedInsert, UncertainWrite, WorkflowError
 from ym_playlist_maker.store import DraftStore
-from ym_playlist_maker.youtube import BeforeInsertError
+from ym_playlist_maker.youtube import BeforeCreateError, BeforeInsertError
 
 
 def api_error(status, reason):
@@ -46,11 +48,11 @@ class FakeYouTube:
     def check_credentials(self):
         pass
 
-    def create_private(self, title, marker):
+    def create_playlist(self, title, marker, privacy):
         if self.create_error:
             error, self.create_error = self.create_error, None
             raise error
-        self.created.append(("playlist1", title, marker))
+        self.created.append(("playlist1", title, marker, privacy))
         if self.fail_create_after_commit:
             self.fail_create_after_commit = False
             raise TimeoutError("lost response")
@@ -117,16 +119,88 @@ def test_publish_skips_duplicate_video_and_is_idempotent(setup):
     assert youtube.items == ["oasis", "numb1"]
 
 
-def test_lost_create_response_reconciles_without_second_playlist(setup):
-    workflow, youtube, _ = setup
+@pytest.mark.parametrize("privacy", ["private", "public"])
+def test_lost_create_response_reconciles_without_second_playlist(setup, tmp_path, privacy):
+    workflow, youtube, store = setup
     prepare(workflow)
     youtube.fail_create_after_commit = True
     with pytest.raises(UncertainWrite):
-        workflow.publish()
-    assert workflow.active().phase == "creating"
-    result = workflow.publish()
-    assert result.phase == "done"
-    assert len(youtube.created) == 1
+        workflow.publish(privacy=privacy)
+    saved = store.load().to_dict()
+    assert saved["phase"] == "creating" and saved["privacy"] == privacy
+    opposite = "public" if privacy == "private" else "private"
+    calls = (youtube.created.copy(), youtube.events.copy(), youtube.item_reads)
+    with pytest.raises(WorkflowError, match="review is outdated"):
+        workflow.publish(privacy=opposite)
+    assert store.load().to_dict() == saved
+    assert (youtube.created, youtube.events, youtube.item_reads) == calls
+    store.close()
+    reopened = DraftStore(tmp_path / "state.sqlite3")
+    try:
+        recovered = PlaylistWorkflow(reopened, FakeSearch(), youtube)
+        result = recovered.publish()
+        assert result.phase == "done" and result.privacy == privacy
+        assert youtube.created == [("playlist1", result.title, result.create_marker, privacy)]
+        assert youtube.items == ["oasis", "numb1"]
+    finally:
+        reopened.close()
+
+
+@pytest.mark.parametrize("legacy", [True, False])
+def test_persisted_visibility_survives_store_restart(setup, tmp_path, legacy):
+    workflow, youtube, store = setup
+    draft = prepare(workflow)
+    path = tmp_path / "state.sqlite3"
+    if not legacy:
+        draft.privacy = "public"
+        store.save(draft)
+    store.close()
+    if legacy:
+        with sqlite3.connect(path) as db:
+            payload = json.loads(db.execute("SELECT data FROM draft WHERE slot = 1").fetchone()[0])
+            del payload["privacy"]
+            db.execute("UPDATE draft SET data = ? WHERE slot = 1", (json.dumps(payload),))
+    reopened = DraftStore(path)
+    try:
+        recovered = PlaylistWorkflow(reopened, FakeSearch(), youtube)
+        privacy = "private" if legacy else "public"
+        assert reopened.load().privacy == privacy
+        result = recovered.publish()
+        assert result.phase == "done" and result.privacy == privacy
+        assert youtube.created == [("playlist1", result.title, result.create_marker, privacy)]
+    finally:
+        reopened.close()
+
+
+@pytest.mark.parametrize("privacy", ["unlisted", ""])
+def test_invalid_visibility_does_not_check_credentials_or_save(setup, privacy):
+    workflow, youtube, store = setup
+    prepare(workflow)
+    saved = store.load().to_dict()
+    youtube.check_credentials = lambda: pytest.fail("Invalid privacy reached credentials")
+    with pytest.raises(ValueError, match="^Playlist privacy must be private or public$"):
+        workflow.publish(privacy=privacy)
+    assert store.load().to_dict() == saved
+    assert youtube.created == []
+
+
+@pytest.mark.parametrize("phase", ["creating", "writing", "done"])
+def test_explicit_visibility_cannot_change_started_playlist(setup, monkeypatch, phase):
+    workflow, youtube, store = setup
+    draft = prepare(workflow)
+    draft.phase = phase
+    draft.privacy = "public"
+    draft.playlist_id = None if phase == "creating" else "playlist1"
+    store.save(draft)
+    before = draft.to_dict()
+    def forbidden(*args, **kwargs):
+        pytest.fail("Outdated review reached persistence or YouTube")
+    for name in ("check_credentials", "create_playlist", "find_created", "item_ids", "add"):
+        monkeypatch.setattr(youtube, name, forbidden)
+    monkeypatch.setattr(store, "save", forbidden)
+    with pytest.raises(WorkflowError, match="review is outdated"):
+        workflow.publish(privacy="private")
+    assert store.load().to_dict() == before
 
 
 def test_lost_add_response_reconciles_without_second_insert(setup):
@@ -243,14 +317,23 @@ def test_old_retry_button_rejected_after_new_uncertain_attempt_with_lagged_reads
     assert youtube.items == ["oasis", "numb1"]
 
 
-def test_create_429_returns_to_confirm_for_retry(setup):
+@pytest.mark.parametrize("error", [
+    api_error(429, "rateLimitExceeded"), api_error(403, "forbidden"),
+    BeforeCreateError("not dispatched"),
+])
+def test_definitive_creation_failure_retains_public_and_allows_private_retry(setup, error):
     workflow, youtube, _ = setup
     prepare(workflow)
-    youtube.create_error = api_error(429, "rateLimitExceeded")
-    with pytest.raises(HttpError):
-        workflow.publish()
+    youtube.create_error = error
+    with pytest.raises((HttpError, WorkflowError)):
+        workflow.publish(privacy="public")
     assert workflow.active().phase == "confirm"
-    assert workflow.publish().phase == "done"
+    assert workflow.active().privacy == "public"
+    assert youtube.created == []
+    result = workflow.publish(privacy="private")
+    assert result.phase == "done" and result.privacy == "private"
+    assert youtube.created == [("playlist1", result.title, result.create_marker, "private")]
+    assert youtube.items == ["oasis", "numb1"]
 
 
 @pytest.mark.parametrize("reason,skipped", [("videoNotFound", True), ("playlistNotFound", False)])
