@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import re
+from typing import Literal
 
 from telegram import BotCommand, BotCommandScopeChat, InlineKeyboardButton, InlineKeyboardMarkup, MenuButtonCommands, Update
 from telegram.constants import ChatType
@@ -293,11 +294,15 @@ class BotUI:
                     await asyncio.to_thread(self.workflow.request_search_again, int(parts[3]), int(parts[4]))
                     await self._send_text(update, self._t("Send a new search query for this song."))
                     return
-                elif action == "create" and len(parts) in (3, 4):
-                    expected = int(parts[3]) if len(parts) == 4 else 0
+                elif action == "create":
+                    if len(parts) in (3, 4):
+                        raise WorkflowError("This review is outdated; use /resume")
+                    if len(parts) != 5 or parts[4] not in ("private", "public"):
+                        raise WorkflowError("Invalid button")
+                    expected = int(parts[3])
                     if draft.phase != "confirm" or draft.review_revision != expected:
                         raise WorkflowError("This review is outdated; use /resume")
-                    draft = await self._publish(update, expected_review_revision=expected if len(parts) == 4 else None)
+                    draft = await self._publish(update, expected_review_revision=expected, privacy=parts[4])
                     await self._done(update, draft)
                     return
                 elif action == "retryinsert" and len(parts) == 5:
@@ -316,7 +321,8 @@ class BotUI:
             except Exception as exc:
                 await self._error(update, exc)
 
-    async def _publish(self, update: Update, *, expected_review_revision: int | None = None) -> Draft:
+    async def _publish(self, update: Update, *, expected_review_revision: int | None = None,
+                       privacy: Literal["private", "public"] | None = None) -> Draft:
         loop = asyncio.get_running_loop()
 
         def on_playlist_pending() -> None:
@@ -336,6 +342,8 @@ class BotUI:
         kwargs = {"on_playlist_pending": on_playlist_pending}
         if expected_review_revision is not None:
             kwargs["expected_review_revision"] = expected_review_revision
+        if privacy is not None:
+            kwargs["privacy"] = privacy
         return await asyncio.to_thread(self.workflow.publish, **kwargs)
 
     async def _show_state(self, update: Update) -> None:
@@ -422,11 +430,12 @@ class BotUI:
                 lines.append(self._t("Skipped lines: {lines}", lines=", ".join(map(str, skipped))))
             await self._send_lines(update, [self._t("{title}: selected recordings", title=draft.title)] + lines)
             base = f"d:{draft.draft_id}:"
-            rows = [[
-                InlineKeyboardButton(self._t("Create private playlist"), callback_data=base + f"create:{draft.review_revision}"),
-                InlineKeyboardButton(self._t("Cancel"), callback_data=base + "cancel"),
-            ]]
-            summary = self._t("Reviewed {count} selected entries. Use /edit <source line> to change a recording. Create a private playlist?", count=len(selected))
+            rows = [
+                [InlineKeyboardButton(self._t("Create private playlist"), callback_data=base + f"create:{draft.review_revision}:private")],
+                [InlineKeyboardButton(self._t("Create public playlist"), callback_data=base + f"create:{draft.review_revision}:public")],
+                [InlineKeyboardButton(self._t("Cancel"), callback_data=base + "cancel")],
+            ]
+            summary = self._t("Reviewed {count} selected entries. Use /edit <source line> to change a recording. Create a private or public playlist?", count=len(selected))
             await self._send_text(update, summary, reply_markup=InlineKeyboardMarkup(rows))
         elif draft.phase == "done":
             await self._done(update, draft)

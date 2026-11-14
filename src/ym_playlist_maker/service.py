@@ -4,6 +4,7 @@ import logging
 
 from collections.abc import Callable
 from time import sleep
+from typing import Literal
 from uuid import uuid4
 
 from googleapiclient.errors import HttpError
@@ -178,24 +179,31 @@ class PlaylistWorkflow:
         return self._write_tracks(draft)
 
     def publish(self, *, on_playlist_pending: Callable[[], None] | None = None,
-                expected_review_revision: int | None = None) -> Draft:
+                expected_review_revision: int | None = None,
+                privacy: Literal["private", "public"] | None = None) -> Draft:
         draft = self._require()
         if expected_review_revision is not None and (
             draft.phase != "confirm" or draft.review_revision != expected_review_revision
         ):
             raise WorkflowError("This review is outdated; use /resume")
+        if privacy is not None and draft.phase != "confirm":
+            raise WorkflowError("This review is outdated; use /resume")
         if draft.phase == "done":
             return draft
         if draft.phase == "confirm":
+            privacy = draft.privacy if privacy is None else privacy
+            if privacy not in ("private", "public"):
+                raise ValueError("Playlist privacy must be private or public")
             if not any(t.status == "selected" and t.selected for t in draft.tracks):
                 raise WorkflowError("All songs have been skipped; use /cancel")
             # Fail before entering the uncertain creation phase when credentials are missing.
             self.youtube.check_credentials()
+            draft.privacy = privacy
             draft.phase = "creating"
             draft.create_marker = f"Personal playlist bot draft {draft.draft_id}"
             self.store.save(draft)
             try:
-                draft.playlist_id = self.youtube.create_private(draft.title, draft.create_marker)
+                draft.playlist_id = self.youtube.create_playlist(draft.title, draft.create_marker, draft.privacy)
             except BeforeCreateError as exc:
                 draft.phase = "confirm"
                 self.store.save(draft)

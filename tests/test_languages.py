@@ -180,19 +180,65 @@ def test_russian_start_review_and_stale_button_keep_draft_unchanged(tmp_path):
     assert "/language" in update.effective_message.sent[0][0]
     update = make_update()
     asyncio.run(ui.resume(update, None))
-    review, options = update.effective_message.sent[-1]
-    assert "Создать приватный плейлист?" in review
-    assert options["reply_markup"].inline_keyboard[0][0].text == "Создать приватный плейлист"
-    assert options["reply_markup"].inline_keyboard[0][0].callback_data == "d:draft123:create:3"
+    _, options = update.effective_message.sent[-1]
+    rows = options["reply_markup"].inline_keyboard
+    assert rows[0][0].text == "Создать приватный плейлист"
+    assert rows[0][0].callback_data == "d:draft123:create:3:private"
+    assert rows[1][0].text == "Создать публичный плейлист"
+    assert rows[1][0].callback_data == "d:draft123:create:3:public"
     details = update.effective_message.sent[0][0]
     assert "Original Playlist: выбранные записи" in details
     assert "Original Song — Original Artist · альбом: Original Album · 3:42" in details
     assert "повтор будет пропущен" in details
     assert "Пропущенные строки: 7" in details
-    stale = make_update(data="d:draft123:create:2")
+    stale = make_update(data="d:draft123:create:2:public")
     asyncio.run(ui.callback(stale, None))
     assert "Эта проверка устарела" in stale.effective_message.sent[0][0]
     assert store.load().to_dict() == before
+    store.close()
+
+
+@pytest.mark.parametrize("code", LANGUAGES)
+@pytest.mark.parametrize("action", ["private", "public", "cancel"])
+def test_localized_review_actions_remain_usable(tmp_path, monkeypatch, code, action):
+    from test_workflow import FakeSearch, FakeYouTube, prepare
+
+    monkeypatch.setattr("ym_playlist_maker.service.sleep", lambda _: None)
+    store = DraftStore(tmp_path / "state.sqlite3")
+    store.set_language(code)
+    youtube = FakeYouTube()
+    workflow = PlaylistWorkflow(store, FakeSearch(), youtube)
+    draft = prepare(workflow)
+    before = draft.to_dict()
+    ui = BotUI(BotConfig("dummy", 123, Path("unused")), workflow)
+    update = make_update()
+    asyncio.run(ui.resume(update, None))
+    rows = update.effective_message.sent[-1][1]["reply_markup"].inline_keyboard
+    assert [len(row) for row in rows] == [1, 1, 1]
+    assert [row[0].text for row in rows] == [
+        translate(code, key) for key in ("Create private playlist", "Create public playlist", "Cancel")
+    ]
+    assert [row[0].callback_data for row in rows] == [
+        f"d:{draft.draft_id}:create:{draft.review_revision}:private",
+        f"d:{draft.draft_id}:create:{draft.review_revision}:public",
+        f"d:{draft.draft_id}:cancel",
+    ]
+    assert store.load().to_dict() == before
+    index = {"private": 0, "public": 1, "cancel": 2}[action]
+    callback = make_update(data=rows[index][0].callback_data)
+    asyncio.run(ui.callback(callback, None))
+    if action == "cancel":
+        assert store.load() is None
+        assert youtube.created == []
+        assert callback.effective_message.sent[-1][0] == translate(code, "Draft cancelled.")
+    else:
+        saved = store.load()
+        assert saved.phase == "done" and saved.privacy == action
+        assert youtube.created == [("playlist1", saved.title, saved.create_marker, action)]
+        assert youtube.items == ["oasis", "numb1"]
+        assert translate(code, "Done: {added} songs. {url}", added=2,
+                         url="https://music.youtube.com/playlist?list=playlist1") in callback.effective_message.sent[-1][0]
+    assert store.get_language() == code
     store.close()
 
 
