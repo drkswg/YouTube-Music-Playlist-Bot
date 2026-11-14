@@ -1,0 +1,8 @@
+# Local configuration and runtime credentials/state (keep private).
+.env
+data/
+
+# Local repository guidance and working records.
+AGENTS.md
+
+# Recreate virtual environments, caches, and generated package metadata.

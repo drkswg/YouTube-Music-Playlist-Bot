@@ -12,6 +12,5 @@ token.json
 *.sqlite3
 .idea/
 docs/
-plan.md
 AGENTS.md
 

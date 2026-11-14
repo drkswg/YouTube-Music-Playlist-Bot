@@ -55,7 +55,6 @@ ym_playlist_maker/
 ├── .gitignore                   # Local state, secrets, and generated file exclusions
 ├── .dockerignore                # Container build context exclusions
 ├── AGENTS.md                    # Local repository guidelines
-├── plan.md                      # Current task record, while a task is open
 ├── src/
 │   └── ym_playlist_maker/
 │       ├── __init__.py           # Package initialization
@@ -82,7 +81,7 @@ ym_playlist_maker/
 └── data/                        # Docker runtime token and SQLite state
 ```
 
-`AGENTS.md`, `plan.md`, and `docs/` are local working records excluded from Git. The runtime `data/` directory is also excluded from Git and the Docker build context. Local execution defaults to `%LOCALAPPDATA%\ym_playlist_maker`; `YM_DATA_DIR` overrides the runtime location. OAuth client files are supplied separately from a private location.
+`AGENTS.md` and `docs/` are local working records excluded from Git. The runtime `data/` directory is also excluded from Git and the Docker build context. Local execution defaults to `%LOCALAPPDATA%\ym_playlist_maker`; `YM_DATA_DIR` overrides the runtime location. OAuth client files are supplied separately from a private location.
 
 ## Technical Stack
 
