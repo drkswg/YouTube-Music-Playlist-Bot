@@ -54,12 +54,13 @@ def test_adapter_selects_hidden_candidate_using_only_local_labels(monkeypatch):
     body = json.loads(request.data)
     assert "tools" not in body
     schema = body["generationConfig"]["responseSchema"]
-    assert schema["properties"]["choice"]["enum"] == [f"c{i}" for i in range(8)] + ["abstain"]
+    assert schema["properties"]["choice"]["enum"] == [f"c{i}" for i in range(8)] + ["none"]
     assert "video_id" not in body["contents"][0]["parts"][0]["text"]
 
 
 @pytest.mark.parametrize("payload", [
     reply("id7"), reply("c99"), reply("abstain"), reply("c0", "insufficient_evidence"),
+    reply("none", "preferred_release"), reply("c0", "no_match"),
     reply(finish="MAX_TOKENS"), reply(finish="SAFETY"), {"promptFeedback": {"blockReason": "SAFETY"}},
     {"candidates": []}, {"candidates": [reply()["candidates"][0]] * 2},
     {"candidates": "bad"}, b"not json", reply(None), reply(reason=[]),
@@ -70,9 +71,22 @@ def test_invalid_and_blocked_provider_results_are_safe(monkeypatch, payload):
         GeminiSelector("secret").select(selection_input())
 
 
-def test_abstain(monkeypatch):
-    mock_response(monkeypatch, reply("abstain", "insufficient_evidence"))
-    assert GeminiSelector("secret").select(selection_input()) == SelectionDecision(None, "insufficient_evidence")
+def test_no_match_decision(monkeypatch):
+    mock_response(monkeypatch, reply("none", "no_match"))
+    assert GeminiSelector("secret").select(selection_input()) == SelectionDecision(None, "no_match")
+
+
+def test_non_eligible_candidate_can_be_chosen_and_schema_lists_all_labels(monkeypatch):
+    track = Track("Artist", "Song", 1, candidates=candidates())
+    value = SelectionInput.from_track(track, ("id1",), "no_confident_match")
+    calls = mock_response(monkeypatch, reply("c0", "closest_version"))
+    assert GeminiSelector("secret").select(value) == SelectionDecision("id0", "closest_version")
+    body = json.loads(calls[0][0].data)
+    schema = body["generationConfig"]["responseSchema"]["properties"]
+    assert schema["choice"]["enum"] == [f"c{i}" for i in range(8)] + ["none"]
+    assert schema["reason"]["enum"] == ["preferred_release", "requested_version", "closest_version", "no_match"]
+    rows = json.loads(body["contents"][0]["parts"][0]["text"])["candidates"]
+    assert [row["eligible"] for row in rows] == [False, True] + [False] * 6
 
 
 @pytest.mark.parametrize("error,code", [
@@ -157,10 +171,17 @@ def test_leading_artist_article_is_checked_by_gemini_without_local_guess(request
 
 
 @pytest.fixture
-def workflow(tmp_path):
+def workflow(tmp_path, monkeypatch):
     store = DraftStore(tmp_path / "state.sqlite3")
     selector = SimpleNamespace(select=lambda value: SelectionDecision("id7", "preferred_release"))
-    flow = PlaylistWorkflow(store, SimpleNamespace(songs=lambda query: candidates()), None, selector)
+    queries = []
+    def songs(query):
+        queries.append(query)
+        return candidates()
+    flow = PlaylistWorkflow(store, SimpleNamespace(songs=songs), None, selector)
+    flow.search_queries = queries
+    flow.delays = []
+    monkeypatch.setattr("ym_playlist_maker.service.sleep", flow.delays.append)
     flow.start("\nArtist — Song\nArtist — Song")
     yield flow
     store.close()
@@ -173,8 +194,8 @@ def test_featured_studio_result_is_chosen_without_model_or_manual_prompt(workflo
         Candidate("unclear", "Song (Special Version)", ["Artist"]),
     ]
     workflow.selector.select = lambda value: pytest.fail("clean studio match should not call Gemini")
-    draft, index = workflow.next_unresolved()
-    assert index is None and draft.phase == "title"
+    draft = workflow.resolve_pending()
+    assert draft.phase == "title"
     assert [t.selected for t in draft.tracks] == ["studio", "studio"]
     assert all(t.selection_record is None for t in draft.tracks)
 
@@ -193,8 +214,8 @@ def test_ambiguous_featured_releases_reach_gemini_with_alternates_excluded(workf
         assert value.rules_reason == "different_durations"
         return SelectionDecision("first", "preferred_release")
     workflow.selector.select = select
-    draft, index = workflow.next_unresolved()
-    assert index is None and len(calls) == 2
+    draft = workflow.resolve_pending()
+    assert len(calls) == 2
     assert all(t.selected == "first" and t.selection_record.status == "selected" for t in draft.tracks)
 
 
@@ -209,8 +230,8 @@ def test_abbreviated_title_is_decided_by_gemini_and_not_guessed_locally(workflow
         assert value.eligible_ids == ("subtitle",)
         return SelectionDecision("subtitle", "preferred_release")
     workflow.selector.select = select
-    draft, index = workflow.next_unresolved()
-    assert index is None and len(calls) == 2
+    draft = workflow.resolve_pending()
+    assert len(calls) == 2
     assert all(t.selection_record.status == "selected" for t in draft.tracks)
 
 
@@ -218,24 +239,24 @@ def test_abbreviated_title_is_decided_by_gemini_and_not_guessed_locally(workflow
     ("Song (Demo)", "unsupported_qualifier"), ("Song (Live)", "version_unavailable"),
     ("Different Song", "no_confident_match"),
 ])
-def test_no_eligible_results_are_manual_and_log_why_gemini_was_not_called(workflow, caplog, title, reason):
-    caplog.set_level(logging.INFO, logger="ym_playlist_maker.service")
+def test_no_eligible_results_still_reach_gemini_with_local_hint(workflow, title, reason):
     workflow.search.songs = lambda query: [Candidate("id", title, ["Artist"])]
-    workflow.selector.select = lambda value: pytest.fail("no eligible result")
-    draft, index = workflow.next_unresolved()
-    assert index == 0 and draft.tracks[0].selection_record is None
-    assert "source_line=2" in caplog.text and f"rules_reason={reason}" in caplog.text
-    assert "gemini_status=no_eligible_candidates" in caplog.text
-    assert "candidates=1 eligible=0" in caplog.text
-    assert title not in caplog.text and "Artist" not in caplog.text
+    seen = []
+    def select(value):
+        seen.append(value)
+        return SelectionDecision("id", "closest_version")
+    workflow.selector.select = select
+    draft = workflow.resolve_pending()
+    assert seen[0].eligible_ids == () and seen[0].rules_reason == reason
+    assert draft.tracks[0].selected == "id" and draft.tracks[0].selection_record.reason == "closest_version"
 
 
-def test_model_abstention_logs_a_manual_decision_without_provider_failure(workflow, caplog):
+def test_model_no_match_logs_skip_without_provider_failure(workflow, caplog):
     caplog.set_level(logging.INFO, logger="ym_playlist_maker.service")
-    workflow.selector.select = lambda value: SelectionDecision(None, "insufficient_evidence")
-    draft, index = workflow.next_unresolved()
-    assert index == 0 and draft.tracks[0].selection_record.status == "abstained"
-    assert "gemini_status=abstained" in caplog.text
+    workflow.selector.select = lambda value: SelectionDecision(None, "no_match")
+    draft = workflow.resolve_pending()
+    assert draft.tracks[0].selection_record.status == "no_match" and draft.tracks[0].status == "skipped"
+    assert "Recording skipped: source_line=2 skip_reason=no_match" in caplog.text
     assert "Gemini selection failed" not in caplog.text
 
 
@@ -250,19 +271,24 @@ def test_attempt_is_persisted_before_dispatch_and_selected_results_survive_resta
         calls.append(value)
         return SelectionDecision("id7", "preferred_release")
     workflow.selector.select = select
-    draft, index = workflow.next_unresolved()
-    assert index is None and draft.phase == "title"
+    draft = workflow.resolve_pending()
+    assert draft.phase == "title"
     assert [t.selected for t in draft.tracks] == ["id7", "id7"]
     assert len(calls) == 2
     again = PlaylistWorkflow(workflow.store, workflow.search, None, workflow.selector)
-    again.next_unresolved()
+    again.resolve_pending()
     assert len(calls) == 2
     assert again.active().tracks[0].selection_record.status == "selected"
 
 
-@pytest.mark.parametrize("result", [SelectionDecision(None, "insufficient_evidence"), SelectionError("http_429"),
-                                    SelectionDecision("live", "preferred_release"), RuntimeError("secret")])
-def test_manual_fallback_persists_and_never_repeats(workflow, result):
+@pytest.mark.parametrize("result,reason,record_status,expected_calls", [
+    (SelectionDecision(None, "no_match"), "no_match", "no_match", 1),
+    (SelectionError("http_429"), "selection_failed", "failed", 3),
+    (SelectionDecision("live", "preferred_release"), "selection_failed", "failed", 3),
+    (SelectionDecision("id1", "no_match"), "selection_failed", "failed", 3),
+    (RuntimeError("secret"), "selection_failed", "failed", 3),
+])
+def test_skipped_outcomes_persist_and_never_repeat(workflow, result, reason, record_status, expected_calls):
     calls = []
     def select(value):
         calls.append(1)
@@ -270,15 +296,16 @@ def test_manual_fallback_persists_and_never_repeats(workflow, result):
             raise result
         return result
     workflow.selector.select = select
-    draft, index = workflow.next_unresolved()
-    assert index == 0 and draft.tracks[0].selected is None
-    assert draft.tracks[0].selection_record.status in ("failed", "abstained")
-    workflow.next_unresolved()
-    assert calls == [1]
+    draft = workflow.resolve_pending()
+    assert draft.tracks[0].selected is None and draft.tracks[0].status == "skipped"
+    assert draft.tracks[0].skip_reason == reason
+    assert draft.tracks[0].selection_record.status == record_status
+    workflow.resolve_pending()
+    assert len(calls) == expected_calls * 2  # both source lines are processed once
     assert "secret" not in json.dumps(workflow.active().to_dict())
 
 
-@pytest.mark.parametrize("mutation", ["cancel", "new_draft", "revision", "await_query", "snapshot"])
+@pytest.mark.parametrize("mutation", ["cancel", "new_draft", "revision", "snapshot"])
 def test_stale_provider_result_cannot_overwrite_state(workflow, mutation):
     def select(value):
         if mutation == "cancel":
@@ -290,48 +317,32 @@ def test_stale_provider_result_cannot_overwrite_state(workflow, mutation):
             draft = workflow.active()
             if mutation == "revision":
                 draft.tracks[0].search_revision += 1
-            elif mutation == "await_query":
-                draft.tracks[0].await_query = True
             else:
                 draft.tracks[0].candidates[0].album = "Changed"
             workflow.store.save(draft)
         return SelectionDecision("id7", "preferred_release")
     workflow.selector.select = select
     with pytest.raises(WorkflowError, match="changed"):
-        workflow.next_unresolved()
+        workflow.resolve_pending()
     draft = workflow.active()
     assert draft is None or draft.tracks[0].selected is None
 
 
-def test_existing_custom_and_interrupted_snapshots_remain_manual(workflow):
-    def fail(value):
-        raise AssertionError("must not call")
-    workflow.selector.select = fail
-    draft = workflow.active()
-    draft.tracks[0].search_query = "Artist Song"
-    draft.tracks[0].candidates = candidates()
-    workflow.store.save(draft)
-    assert workflow.next_unresolved()[1] == 0
-    workflow.request_search_again(0)
-    workflow.search_again(0, "Artist Song")
-    assert workflow.active().tracks[0].selection_record is None
-    assert workflow.next_unresolved()[1] == 0
-
 
 def test_edit_uses_source_line_keeps_title_and_invalidates_old_create(workflow):
-    workflow.next_unresolved()
+    workflow.resolve_pending()
     workflow.set_title("My playlist")
-    workflow.edit(2)
+    workflow.edit(2, "Artist Song live")
     draft = workflow.active()
-    assert draft.title == "My playlist" and draft.review_revision == 1
+    assert draft.title == "My playlist" and draft.review_revision == 1 and draft.phase == "resolving"
     assert draft.tracks[0].search_revision == 2 and draft.tracks[0].selection_record is None
+    assert draft.tracks[0].candidates == [] and draft.tracks[0].search_query == "Artist Song live"
     assert draft.tracks[1].selected == "id7"
     with pytest.raises(WorkflowError, match="outdated"):
         workflow.publish(expected_review_revision=0)
-    draft, index = workflow.next_unresolved()
-    assert index == 0
-    workflow.choose(0, 1, 2)
-    assert workflow.next_unresolved()[0].phase == "confirm"
+    draft = workflow.resolve_pending()
+    assert draft.phase == "confirm" and draft.tracks[0].selected == "id7"
+    assert workflow.search_queries[-1] == "Artist Song live"
 
 
 def test_config_optional_key_hidden_and_legacy_json(monkeypatch):
@@ -362,35 +373,23 @@ def test_selection_ui_progress_runs_on_loop_and_delivery_failure_does_not_affect
     asyncio.run(run())
 
 
-def test_interrupted_attempt_does_not_repeat_after_restart(workflow):
-    def interrupted(value):
-        raise KeyboardInterrupt
-    workflow.selector.select = interrupted
-    with pytest.raises(KeyboardInterrupt):
-        workflow.next_unresolved()
-    assert workflow.active().tracks[0].selection_record.status == "attempted"
-    workflow.selector.select = lambda value: pytest.fail("repeat")
-    restarted = PlaylistWorkflow(workflow.store, workflow.search, None, workflow.selector)
-    assert restarted.next_unresolved()[1] == 0
-
-
 def test_skip_last_edit_cannot_create_empty_playlist(workflow):
-    workflow.next_unresolved()
+    workflow.resolve_pending()
     draft = workflow.active()
     draft.tracks[1].status = "skipped"
     workflow.store.save(draft)
     workflow.set_title("Keep title")
-    workflow.edit(2)
-    workflow.skip(0, 2)
+    workflow.edit(2, "query")
+    workflow.selector.select = lambda value: SelectionDecision(None, "no_match")
     with pytest.raises(WorkflowError, match="All songs"):
-        workflow.next_unresolved()
+        workflow.resolve_pending()
     with pytest.raises(WorkflowError):
         workflow.publish(expected_review_revision=0)
 
 
 @pytest.mark.parametrize("state", ["wrong_line", "title", "writing", "playlist", "insert_history", "uncertain", "added"])
 def test_edit_rejects_invalid_boundary(workflow, state):
-    workflow.next_unresolved()
+    workflow.resolve_pending()
     workflow.set_title("Title")
     draft = workflow.active()
     if state in ("title", "writing"):
@@ -404,7 +403,7 @@ def test_edit_rejects_invalid_boundary(workflow, state):
     workflow.store.save(draft)
     before = workflow.active().to_dict()
     with pytest.raises(WorkflowError):
-        workflow.edit(1 if state == "wrong_line" else 2)
+        workflow.edit(1 if state == "wrong_line" else 2, "query")
     assert workflow.active().to_dict() == before
 
 
@@ -414,20 +413,19 @@ def test_edit_after_definitive_creation_429_is_retriable(workflow, monkeypatch):
     youtube.create_error = api_error(429, "quotaExceeded")
     workflow.youtube = youtube
     monkeypatch.setattr("ym_playlist_maker.service.sleep", lambda seconds: None)
-    workflow.next_unresolved()
+    workflow.resolve_pending()
     workflow.set_title("Title")
     with pytest.raises(Exception):
         workflow.publish(expected_review_revision=0)
     assert workflow.active().phase == "confirm" and workflow.active().create_marker
-    workflow.edit(2)
-    workflow.choose(0, 0, 2)
-    workflow.next_unresolved()
+    workflow.edit(2, "Artist Song live")
+    workflow.resolve_pending()
     assert workflow.publish(expected_review_revision=1).phase == "done"
     assert len(youtube.created) == 1
 
 
 def test_ui_edit_owner_only_and_source_line(workflow):
-    workflow.next_unresolved()
+    workflow.resolve_pending()
     workflow.set_title("Title")
     sent = []
     class Message:
@@ -436,20 +434,22 @@ def test_ui_edit_owner_only_and_source_line(workflow):
     ui = BotUI(BotConfig("dummy", 123, Path("unused")), workflow)
     update = SimpleNamespace(effective_user=SimpleNamespace(id=456),
                              effective_chat=SimpleNamespace(type=ChatType.PRIVATE), effective_message=Message())
-    asyncio.run(ui.edit(update, SimpleNamespace(args=["2"])))
-    assert workflow.active().phase == "confirm" and not sent
+    asyncio.run(ui.edit(update, SimpleNamespace(args=["2", "Artist", "live"])))
+    assert workflow.active().review_revision == 0 and not sent
     update.effective_user.id = 123
     asyncio.run(ui.edit(update, SimpleNamespace(args=["2"])))
-    assert workflow.active().phase == "resolving" and sent
+    assert workflow.active().review_revision == 0 and "Use /edit" in sent[-1][0]
+    asyncio.run(ui.edit(update, SimpleNamespace(args=["2", "Artist", "live"])))
+    assert workflow.active().review_revision == 1 and workflow.active().phase == "confirm"
+    assert workflow.search_queries[-1] == "Artist live"
 
 
 def test_ui_stale_and_legacy_create_buttons_rejected_after_edit(workflow):
-    workflow.next_unresolved()
+    workflow.resolve_pending()
     workflow.set_title("Title")
     draft_id = workflow.active().draft_id
-    workflow.edit(2)
-    workflow.choose(0, 0, 2)
-    workflow.next_unresolved()
+    workflow.edit(2, "Artist Song live")
+    workflow.resolve_pending()
     sent = []
     class Message:
         async def reply_text(self, text, **kwargs):
@@ -465,14 +465,6 @@ def test_ui_stale_and_legacy_create_buttons_rejected_after_edit(workflow):
         assert "outdated" in sent[-1]
     assert workflow.active().phase == "confirm"
 
-
-def test_legacy_snapshot_without_query_is_not_researched(workflow):
-    draft = workflow.active()
-    draft.tracks[0].candidates = candidates()
-    workflow.store.save(draft)
-    workflow.search.songs = lambda query: pytest.fail("legacy search")
-    workflow.selector.select = lambda value: pytest.fail("legacy selection")
-    assert workflow.next_unresolved()[1] == 0
 
 
 def test_explicit_provider_block_with_completed_content_is_rejected(monkeypatch):
@@ -534,9 +526,11 @@ def test_failed_workflow_logs_and_persists_only_safe_diagnostics(workflow, caplo
     def fail(value):
         raise SelectionError(code, detail)
     workflow.selector.select = fail
-    draft, index = workflow.next_unresolved()
-    assert index == 0
-    record = draft.tracks[0].selection_record
+    draft = workflow.resolve_pending()
+    track = draft.tracks[0]
+    assert track.status == "skipped" and track.skip_reason == "selection_failed"
+    record = track.selection_record
+    assert record.status == "failed"
     assert record.error_code == (code if code in selection.ERROR_CODES else "selector_error")
     assert record.error_detail == (detail if detail in selection.ERROR_DETAILS else None)
     assert "Gemini selection failed" in caplog.text and "source_line=2" in caplog.text
@@ -546,32 +540,10 @@ def test_failed_workflow_logs_and_persists_only_safe_diagnostics(workflow, caplo
     reloaded = workflow.active().tracks[0].selection_record
     assert reloaded == record
     caplog.clear()
-    workflow.next_unresolved()
+    workflow.resolve_pending()
     assert "Gemini selection failed" not in caplog.text
 
 
-@pytest.mark.parametrize("code,detail,status,text", [
-    ("http_400", None, "failed", "rejected the request"),
-    ("http_400", "api_key_invalid", "failed", "rejected the API key"),
-    ("http_401", None, "failed", "authentication failed"),
-    ("http_403", None, "failed", "access is denied"),
-    ("http_404", None, "failed", "endpoint is unavailable"),
-    ("http_429", None, "failed", "free quota"),
-    ("transport_error", None, "failed", "network or connection error"),
-    ("transport_error", "timeout", "failed", "connection timeout"),
-    ("invalid_response", "max_tokens", "failed", "truncated"),
-    ("invalid_response", None, "failed", "invalid or incomplete"),
-    (None, None, "attempted", "interrupted"),
-    (None, None, "abstained", "could not choose confidently"),
-    ("secret", "secret", "failed", "unavailable"),
-])
-def test_telegram_explains_safe_failure_categories(code, detail, status, text):
-    from ym_playlist_maker.bot import selection_fallback_message
-    from ym_playlist_maker.models import SelectionRecord
-    record = SelectionRecord("gemini", selection.MODEL, selection.POLICY, "hash", 1,
-                             status=status, error_code=code, error_detail=detail)
-    message = selection_fallback_message(record)
-    assert text in message and "manually" in message and "secret" not in message
 
 
 def test_old_selection_record_loads_without_diagnostic_detail():
@@ -643,17 +615,17 @@ def test_gemini35_final_json_contract_remains_exact(monkeypatch):
 
 
 @pytest.mark.parametrize("status", ["attempted", "abstained", "failed"])
-def test_old_model_pending_record_is_preserved_without_recalling(workflow, status):
+def test_old_model_pending_record_is_reselected_from_stored_candidates(workflow, status):
     from ym_playlist_maker.models import SelectionRecord
     draft = workflow.active()
-    track = draft.tracks[0]
-    track.candidates = candidates()
-    track.search_query = "Artist Song"
-    track.search_revision = 1
-    track.selection_record = SelectionRecord("gemini", "gemini-2.5-flash-lite", selection.POLICY,
-                                             "legacy snapshot hash", 1, status=status)
+    for track in draft.tracks:
+        track.candidates = candidates()
+        track.search_query = "Artist Song"
+        track.search_revision = 1
+        track.selection_record = SelectionRecord("gemini", "gemini-2.5-flash-lite", selection.POLICY,
+                                                 "legacy snapshot hash", 1, status=status)
     workflow.store.save(draft)
-    workflow.selector.select = lambda value: pytest.fail("old model snapshot must remain manual")
-    reloaded, index = workflow.next_unresolved()
-    assert index == 0 and reloaded.tracks[0].selection_record == track.selection_record
-    assert reloaded.tracks[0].search_revision == 1
+    workflow.search.songs = lambda query: pytest.fail("stored candidates must not be searched again")
+    reloaded = workflow.resolve_pending()
+    assert all(t.selected == "id7" and t.selection_record.status == "selected" and t.search_revision == 1
+               for t in reloaded.tracks)

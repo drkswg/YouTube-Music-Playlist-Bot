@@ -15,56 +15,11 @@ from telegram.ext import Application, CallbackQueryHandler, CommandHandler, Cont
 
 from .config import BotConfig
 from .i18n import LANGUAGES, translate, translate_saved_message, safe_workflow_message
-from .models import Draft, SelectionRecord, selected_candidate
-from .parser import resolve_candidates
+from .models import Draft, selected_candidate
 from .service import PlaylistWorkflow, UnconfirmedInsert, UncertainWrite, WorkflowError
 from .youtube import MissingCredentials, http_error_reason
 
 log = logging.getLogger(__name__)
-
-
-_RESOLUTION_MESSAGES = {
-    "no_results": "No matches. Try another query or skip this song.",
-    "no_confident_match": "The title and artist do not match confidently. Please choose a recording.",
-    "version_unavailable": "The requested version was not found (a studio recording is preferred by default). Please choose a version or try another search.",
-    "unsupported_qualifier": "Some version labels are unclear or conflicting. Please check the recordings.",
-    "multiple_recordings": "Several recordings match the requested version. Please choose one.",
-    "different_credits": "Matching recordings have different artist credits. Please choose one.",
-    "duration_unknown": "Several releases match, but their durations are missing or invalid. Please choose a recording.",
-    "different_durations": "Matching releases have different durations and may be different recordings. Please choose one.",
-    "custom_search": "Please choose a recording from your search results.",
-}
-
-
-def selection_fallback_message(record: SelectionRecord, language: str = "en") -> str:
-    """Describe only safe categories, never provider messages or arbitrary codes."""
-    if record.status == "attempted":
-        return translate(language, "Automatic selection was interrupted. The saved search will not be sent again. Please choose manually.")
-    if record.status == "abstained":
-        return translate(language, "Gemini could not choose confidently. Please choose manually.")
-    details = {
-        "api_key_invalid": "Gemini rejected the API key. Check GEMINI_API_KEY.",
-        "service_disabled": "Gemini API is disabled for this project. Check the project configuration.",
-        "api_key_service_blocked": "The API key does not allow Gemini. Check its API restrictions.",
-        "api_key_ip_address_blocked": "The API key blocks this connection. Check its IP restrictions.",
-        "timeout": "Gemini did not respond within the connection timeout.",
-        "max_tokens": "Gemini's response was truncated before completing a decision.",
-        "safety": "Gemini blocked this decision through its safety checks.",
-        "blocked": "Gemini blocked this decision through its content checks.",
-    }
-    categories = {
-        "http_400": "Gemini rejected the request. Check the API key and project configuration.",
-        "http_401": "Gemini authentication failed. Check GEMINI_API_KEY.",
-        "http_403": "Gemini access is denied. Check project access, API restrictions and regional availability.",
-        "http_404": "The configured Gemini model or endpoint is unavailable for this project.",
-        "http_429": "Gemini's free quota or request limit has been reached. Check AI Studio limits.",
-        "transport_error": "Gemini could not be reached due to a network or connection error.",
-        "invalid_response": "Gemini returned an invalid or incomplete decision.",
-        "request_too_large": "The search metadata exceeds the automatic selection request limit.",
-        "response_too_large": "Gemini's response exceeds the automatic selection response limit.",
-    }
-    text = details.get(record.error_detail) or categories.get(record.error_code)
-    return translate(language, text or "Automatic selection is unavailable.") + " " + translate(language, "Please choose manually.")
 
 
 _EXTERNAL_ERROR_MESSAGES = {
@@ -126,7 +81,7 @@ class BotUI:
                     BotCommand("start", self._t("How to send a song list")),
                     BotCommand("resume", self._t("Continue the saved draft")),
                     BotCommand("cancel", self._t("Cancel the draft before creation")),
-                    BotCommand("edit", self._t("Change a recording: /edit <source line>")),
+                    BotCommand("edit", self._t("Search again: /edit <source line> <query>")),
                     BotCommand("language", self._t("Choose the interface language")),
                 ],
                 scope=BotCommandScopeChat(self.config.owner_id),
@@ -152,7 +107,7 @@ class BotUI:
                 await self.configure_menu(context.application)
                 await self._send_text(update, self._t(
                     "Send a list with one song per line, for example Oasis — Wonderwall. "
-                    "Commands: /resume, /cancel, /edit <source line>, /language. Use the Menu button to see all commands."
+                    "Commands: /resume, /cancel, /edit <source line> <query>, /language. Use the Menu button to see all commands."
                 ))
 
     async def language(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -209,9 +164,9 @@ class BotUI:
             return
         async with self.lock:
             try:
-                if len(context.args) != 1 or not context.args[0].isdecimal():
-                    raise WorkflowError("Use /edit <source line number> from the review")
-                await asyncio.to_thread(self.workflow.edit, int(context.args[0]))
+                if len(context.args) < 2 or not context.args[0].isdecimal():
+                    raise WorkflowError("Use /edit <source line number> <search query> from the review")
+                await asyncio.to_thread(self.workflow.edit, int(context.args[0]), " ".join(context.args[1:]))
                 await self._show_state(update)
             except Exception as exc:
                 await self._error(update, exc)
@@ -242,12 +197,7 @@ class BotUI:
                     await asyncio.to_thread(self.workflow.set_title, update.effective_message.text)
                     await self._show_state(update)
                 elif draft and draft.phase == "resolving":
-                    pending = next(((i, t) for i, t in enumerate(draft.tracks) if t.status == "pending"), None)
-                    if pending and pending[1].await_query:
-                        await asyncio.to_thread(self.workflow.search_again, pending[0], update.effective_message.text)
-                        await self._show_state(update)
-                    else:
-                        await self._send_text(update, self._t("First select a version using a button or use /cancel."))
+                    await self._send_text(update, self._t("Songs are still being matched. Use /resume to continue or /cancel."))
                 elif draft and draft.phase in ("confirm", "creating", "writing"):
                     await self._send_text(update, self._t("Use the confirmation button or /resume."))
                 else:
@@ -286,15 +236,7 @@ class BotUI:
                 if not draft or draft.draft_id != parts[1]:
                     raise WorkflowError("This button belongs to an old draft")
                 action = parts[2]
-                if action == "pick" and len(parts) == 6:
-                    await asyncio.to_thread(self.workflow.choose, int(parts[3]), int(parts[5]), int(parts[4]))
-                elif action == "skip" and len(parts) == 5:
-                    await asyncio.to_thread(self.workflow.skip, int(parts[3]), int(parts[4]))
-                elif action == "retry" and len(parts) == 5:
-                    await asyncio.to_thread(self.workflow.request_search_again, int(parts[3]), int(parts[4]))
-                    await self._send_text(update, self._t("Send a new search query for this song."))
-                    return
-                elif action == "create":
+                if action == "create":
                     if len(parts) in (3, 4):
                         raise WorkflowError("This review is outdated; use /resume")
                     if len(parts) != 5 or parts[4] not in ("private", "public"):
@@ -347,70 +289,30 @@ class BotUI:
         return await asyncio.to_thread(self.workflow.publish, **kwargs)
 
     async def _show_state(self, update: Update) -> None:
-        kwargs = {}
-        if getattr(self.workflow, "selector", None) is not None:
-            loop = asyncio.get_running_loop()
+        loop = asyncio.get_running_loop()
 
-            def progress(line: int, total: int) -> None:
-                notification = None
-                future = None
-                try:
-                    notification = self._send_text(update,
-                        self._t("Gemini is choosing a recording for source line {line} ({total} songs). Please wait.", line=line, total=total)
-                    )
-                    future = asyncio.run_coroutine_threadsafe(notification, loop)
-                    future.result(timeout=10)
-                except Exception:
-                    if future is not None:
-                        future.cancel()
-                    elif notification is not None:
-                        notification.close()
-                    log.warning("Could not send recording selection progress")
-
-            kwargs["on_selection_pending"] = progress
-        draft, index = await asyncio.to_thread(self.workflow.next_unresolved, **kwargs)
-        if draft.phase == "resolving" and index is not None:
-            track = draft.tracks[index]
-            if track.await_query:
-                await self._send_text(update,
-                    self._t("{index}/{total}: waiting for a new search query for {artist} — {title}.",
-                            index=index + 1, total=len(draft.tracks), artist=track.artist, title=track.title)
+        def progress(line: int, total: int) -> None:
+            notification = None
+            future = None
+            try:
+                notification = self._send_text(update,
+                    self._t("Gemini is choosing a recording for source line {line} ({total} songs). Please wait.", line=line, total=total)
                 )
-                return
-            base = f"d:{draft.draft_id}:"
-            rows = [
-                [InlineKeyboardButton(
-                    f"{i + 1}. {candidate.title} — {', '.join(candidate.artists)}"[:64],
-                    callback_data=f"{base}pick:{index}:{track.search_revision}:{i}",
-                )]
-                for i, candidate in enumerate(track.candidates[:5])
-            ]
-            rows.append([InlineKeyboardButton(self._t("Try another search"), callback_data=f"{base}retry:{index}:{track.search_revision}")])
-            rows.append([InlineKeyboardButton(self._t("Skip"), callback_data=f"{base}skip:{index}:{track.search_revision}")])
-            text = f"{index + 1}/{len(draft.tracks)}: {track.artist} — {track.title}"
-            # Explain the persisted snapshot without changing its order, revision
-            # or pending status. Canonical custom queries cannot be distinguished
-            # in old JSON, so an automatic decision receives a neutral prompt.
-            decision = resolve_candidates(
-                track, track.candidates,
-                is_custom=track.search_query != f"{track.artist} {track.title}",
-            )
-            text += "\n" + self._t(_RESOLUTION_MESSAGES.get(decision.reason, "Please confirm a recording from the saved search results."))
-            if track.selection_record:
-                text += "\n" + selection_fallback_message(track.selection_record, self.language_code)
-            if track.candidates:
-                for i, candidate in enumerate(track.candidates[:5], start=1):
-                    album = self._t(" · album: {album}", album=candidate.album) if candidate.album else ""
-                    duration = f" · {candidate.duration}" if candidate.duration else ""
-                    text += f"\n{i}. {candidate.title} — {', '.join(candidate.artists)}{album}{duration}"
-                if len(track.candidates) > 5:
-                    text += "\n" + self._t("Showing 5 of {total} results; {hidden} more are hidden. Try another search to narrow the results.", total=len(track.candidates), hidden=len(track.candidates) - 5)
-            await self._send_text(update, text, reply_markup=InlineKeyboardMarkup(rows))
-        elif draft.phase == "title":
+                future = asyncio.run_coroutine_threadsafe(notification, loop)
+                future.result(timeout=10)
+            except Exception:
+                if future is not None:
+                    future.cancel()
+                elif notification is not None:
+                    notification.close()
+                log.warning("Could not send recording selection progress")
+
+        draft = await asyncio.to_thread(self.workflow.resolve_pending, on_selection_pending=progress)
+        if draft.phase == "title":
             await self._send_text(update, self._t("Selection complete. Send a title for the new playlist."))
         elif draft.phase == "confirm":
             selected = [t for t in draft.tracks if t.status == "selected"]
-            skipped = [t.source_line for t in draft.tracks if t.status == "skipped"]
+            skipped = [t.source_line for t in draft.tracks if t.status == "skipped" and t.skip_reason is None]
             lines: list[str] = []
             seen: set[str] = set()
             for track in selected:
@@ -428,6 +330,7 @@ class BotUI:
                 lines.append(detail)
             if skipped:
                 lines.append(self._t("Skipped lines: {lines}", lines=", ".join(map(str, skipped))))
+            lines.extend(self._skip_report(draft))
             await self._send_lines(update, [self._t("{title}: selected recordings", title=draft.title)] + lines)
             base = f"d:{draft.draft_id}:"
             rows = [
@@ -435,7 +338,7 @@ class BotUI:
                 [InlineKeyboardButton(self._t("Create public playlist"), callback_data=base + f"create:{draft.review_revision}:public")],
                 [InlineKeyboardButton(self._t("Cancel"), callback_data=base + "cancel")],
             ]
-            summary = self._t("Reviewed {count} selected entries. Use /edit <source line> to change a recording. Create a private or public playlist?", count=len(selected))
+            summary = self._t("Reviewed {count} selected entries. Use /edit <source line> <search query> to search again for a song. Create a private or public playlist?", count=len(selected))
             await self._send_text(update, summary, reply_markup=InlineKeyboardMarkup(rows))
         elif draft.phase == "done":
             await self._done(update, draft)
@@ -450,7 +353,19 @@ class BotUI:
             message += "\n" + "\n".join((translate_saved_message(self.language_code, error) if safe_workflow_message(error)
                                       else self._t("An external service or internal operation failed. Check the bot logs for the error category."))
                                      for error in draft.errors)
+        report = self._skip_report(draft)
+        if report:
+            message += "\n" + "\n".join(report)
         await self._send_text(update, message)
+
+    def _skip_report(self, draft: Draft) -> list[str]:
+        messages = {
+            "no_results": "Line {line} ({artist} — {title}): no search results, skipped",
+            "no_match": "Line {line} ({artist} — {title}): no matching recording found, skipped",
+            "selection_failed": "Line {line} ({artist} — {title}): automatic selection failed after 3 attempts, skipped",
+        }
+        return [self._t(messages[t.skip_reason], line=t.source_line, artist=t.artist, title=t.title)
+                for t in draft.tracks if t.status == "skipped" and t.skip_reason in messages]
 
     async def _send_lines(self, update: Update, lines: list[str]) -> None:
         await self._send_text(update, "\n".join(lines))

@@ -18,6 +18,9 @@ from .youtube import BeforeCreateError, BeforeInsertError, http_error_reason
 
 log = logging.getLogger(__name__)
 
+SELECTION_ATTEMPTS = 3
+SELECTION_RETRY_DELAY = 2
+
 
 class WorkflowError(RuntimeError):
     pass
@@ -35,7 +38,7 @@ class UnconfirmedInsert(UncertainWrite):
 
 
 class PlaylistWorkflow:
-    def __init__(self, store: DraftStore, search, youtube, selector: Selector | None = None) -> None:
+    def __init__(self, store: DraftStore, search, youtube, selector: Selector) -> None:
         self.store = store
         self.search = search
         self.youtube = youtube
@@ -57,64 +60,30 @@ class PlaylistWorkflow:
         self.store.save(draft)
         return draft, []
 
-    def next_unresolved(self, *, on_selection_pending: Callable[[int, int], None] | None = None) -> tuple[Draft, int | None]:
+    def resolve_pending(self, *, on_selection_pending: Callable[[int, int], None] | None = None) -> Draft:
         draft = self._require()
         if draft.phase != "resolving":
-            return draft, None
+            return draft
         for index in range(len(draft.tracks)):
             track = draft.tracks[index]
             if track.status != "pending":
                 continue
-            if (not track.search_query and not track.candidates and track.search_revision == 0
-                and track.selection_record is None):
-                self._search_into(draft, track, f"{track.artist} {track.title}", on_selection_pending=on_selection_pending)
-                track = draft.tracks[index]
-            if track.status != "pending":
-                continue
-            return draft, index
+            canonical = f"{track.artist} {track.title}"
+            if not track.candidates:
+                query = track.search_query or canonical
+                self._search_into(draft, track, query, is_custom=query != canonical,
+                                  on_selection_pending=on_selection_pending)
+            else:
+                reason = resolve_candidates(
+                    track, track.candidates, is_custom=track.search_query not in ("", canonical)).reason
+                self._select(draft, track, reason, on_selection_pending)
         if draft.title and not any(t.status == "selected" for t in draft.tracks):
             raise WorkflowError("All songs have been skipped; use /cancel")
         draft.phase = "confirm" if draft.title else "title"
         self.store.save(draft)
-        return draft, None
-
-    def search_again(self, index: int, query: str) -> Draft:
-        draft = self._require()
-        track = self._pending_at(draft, index, allow_waiting=True)
-        query = query.strip()
-        if not query or len(query) > 200:
-            raise WorkflowError("Enter a search query between 1 and 200 characters long")
-        self._search_into(draft, track, query, is_custom=True)
-        track.await_query = False
-        self.store.save(draft)
         return draft
 
-    def request_search_again(self, index: int, revision: int | None = None) -> Draft:
-        draft = self._require()
-        track = self._pending_at(draft, index, revision)
-        track.search_revision += 1
-        track.await_query = True
-        self.store.save(draft)
-        return draft
-
-    def choose(self, index: int, candidate_index: int, revision: int | None = None) -> Draft:
-        draft = self._require()
-        track = self._pending_at(draft, index, revision)
-        if not 0 <= candidate_index < min(5, len(track.candidates)):
-            raise WorkflowError("This option is outdated; use /resume")
-        track.selected = track.candidates[candidate_index].video_id
-        track.status = "selected"
-        self.store.save(draft)
-        return draft
-
-    def skip(self, index: int, revision: int | None = None) -> Draft:
-        draft = self._require()
-        track = self._pending_at(draft, index, revision)
-        track.status = "skipped"
-        self.store.save(draft)
-        return draft
-
-    def edit(self, source_line: int) -> Draft:
+    def edit(self, source_line: int, query: str) -> Draft:
         draft = self._require()
         if draft.phase != "confirm" or draft.playlist_id or any(
             t.insert_revision or t.status in ("added", "uncertain") for t in draft.tracks
@@ -123,12 +92,15 @@ class PlaylistWorkflow:
         track = next((t for t in draft.tracks if t.source_line == source_line), None)
         if track is None:
             raise WorkflowError("No song on that source line")
+        query = query.strip()
+        if not query or len(query) > 200:
+            raise WorkflowError("Enter a search query between 1 and 200 characters long")
         track.selected = None
         track.status = "pending"
         track.selection_record = None
-        track.await_query = False
-        # A reopened snapshot is manual, including a legacy empty search query.
-        track.search_query = track.search_query or f"{track.artist} {track.title}"
+        track.skip_reason = None
+        track.candidates = []
+        track.search_query = query
         track.search_revision += 1
         draft.review_revision += 1
         draft.phase = "resolving"
@@ -317,73 +289,88 @@ class PlaylistWorkflow:
         track.search_query = query
         track.search_revision += 1
         track.selection_record = None
+        track.skip_reason = None
+        if not track.candidates:
+            track.status = "skipped"
+            track.skip_reason = "no_results"
+            log.info("Recording skipped: source_line=%s skip_reason=%s candidates=%s eligible=%s",
+                     track.source_line, track.skip_reason, 0, 0)
+            self.store.save(draft)
+            return
         if decision.selected_video_id is not None:
             track.selected = decision.selected_video_id
             track.status = "selected"
-        self.store.save(draft)  # Persist the exact fresh snapshot before any model call.
-        eligible = eligible_candidates(track, track.candidates)
-        if is_custom or self.selector is None or track.status != "pending" or not eligible:
-            if track.status == "pending":
-                if is_custom:
-                    gemini_status = "custom_search"
-                elif self.selector is None:
-                    gemini_status = "not_configured"
-                else:
-                    gemini_status = "no_eligible_candidates"
-                log.info("Recording selection requires manual choice: source_line=%s rules_reason=%s "
-                         "gemini_status=%s candidates=%s eligible=%s",
-                         track.source_line, decision.reason, gemini_status, len(track.candidates), len(eligible))
+            self.store.save(draft)
             return
-        value = SelectionInput.from_track(track, eligible, decision.reason)
+        self.store.save(draft)  # Persist the exact fresh snapshot before any model call.
+        self._select(draft, track, decision.reason, on_selection_pending)
+
+    def _select(self, draft: Draft, track: Track, rules_reason: str,
+                on_selection_pending: Callable[[int, int], None] | None) -> None:
+        eligible = eligible_candidates(track, track.candidates)
+        value = SelectionInput.from_track(track, eligible, rules_reason)
         record = SelectionRecord("gemini", MODEL, POLICY, value.snapshot_hash(), track.search_revision)
         track.selection_record = record
-        self.store.save(draft)  # An interrupted attempted call remains manual on resume.
+        self.store.save(draft)  # An interrupted attempted call is re-run on resume.
         if on_selection_pending is not None:
             try:
                 on_selection_pending(track.source_line, len(draft.tracks))
             except Exception:
                 pass  # Telegram delivery cannot change the recording decision.
-        try:
-            result = self.selector.select(value)
-            if (result.selected_id is not None and result.selected_id not in eligible) or (
-                result.reason not in ("preferred_release", "requested_version", "insufficient_evidence")
-            ) or ((result.selected_id is None) != (result.reason == "insufficient_evidence")):
-                raise SelectionError("invalid_response")
-        except SelectionError as exc:
-            result = None
-            error_code = exc.code
-            error_detail = exc.detail
-        except Exception:
-            result = None
-            error_code = "selector_error"
-            error_detail = None
+        known_ids = {c.video_id for c in track.candidates}
+        result = None
+        error_code = None
+        error_detail = None
+        for attempt in range(1, SELECTION_ATTEMPTS + 1):
+            if attempt > 1:
+                sleep(SELECTION_RETRY_DELAY)
+            try:
+                result = self.selector.select(value)
+                if (result.selected_id is not None and result.selected_id not in known_ids) or (
+                    result.reason not in ("preferred_release", "requested_version", "closest_version", "no_match")
+                ) or ((result.selected_id is None) != (result.reason == "no_match")):
+                    raise SelectionError("invalid_response")
+                break
+            except SelectionError as exc:
+                result = None
+                error_code = exc.code
+                error_detail = exc.detail
+            except Exception:
+                result = None
+                error_code = "selector_error"
+                error_detail = None
+            log.warning("Gemini selection failed: model=%s source_line=%s attempt=%s/%s error_code=%s error_detail=%s",
+                        MODEL, track.source_line, attempt, SELECTION_ATTEMPTS, error_code, error_detail or "none")
         current = self.active()
         index = draft.tracks.index(track)
         if current is None or current.draft_id != draft.draft_id or current.phase != "resolving":
             raise WorkflowError("The draft changed during selection; use /resume")
         latest = current.tracks[index]
-        if (latest.status != "pending" or latest.await_query or latest.search_revision != record.search_revision
+        if (latest.status != "pending" or latest.search_revision != record.search_revision
             or latest.selection_record != record
-            or SelectionInput.from_track(latest, eligible_candidates(latest, latest.candidates), decision.reason).snapshot_hash()
+            or SelectionInput.from_track(latest, eligible_candidates(latest, latest.candidates), rules_reason).snapshot_hash()
                != record.snapshot_hash):
             raise WorkflowError("The search changed during selection; use /resume")
         if result is None:
+            latest.status = "skipped"
+            latest.skip_reason = "selection_failed"
             record.status = "failed"
             record.error_code = error_code
             record.error_detail = error_detail
-            log.warning("Gemini selection failed: model=%s source_line=%s error_code=%s error_detail=%s",
-                        MODEL, latest.source_line, error_code, error_detail or "none")
-        else:
-            record.status = "selected" if result.selected_id else "abstained"
+        elif result.selected_id is not None:
+            latest.selected = result.selected_id
+            latest.status = "selected"
+            record.status = "selected"
             record.selected_id = result.selected_id
             record.reason = result.reason
-            if result.selected_id:
-                latest.selected = result.selected_id
-                latest.status = "selected"
-            else:
-                log.info("Recording selection requires manual choice: source_line=%s rules_reason=%s "
-                         "gemini_status=abstained candidates=%s eligible=%s",
-                         latest.source_line, decision.reason, len(latest.candidates), len(eligible))
+        else:
+            latest.status = "skipped"
+            latest.skip_reason = "no_match"
+            record.status = "no_match"
+            record.reason = "no_match"
+        if latest.status == "skipped":
+            log.info("Recording skipped: source_line=%s skip_reason=%s candidates=%s eligible=%s",
+                     latest.source_line, latest.skip_reason, len(latest.candidates), len(eligible))
         latest.selection_record = record
         self.store.save(current)
         # Continue the same resolution loop using the reloaded, validated state.
@@ -394,15 +381,3 @@ class PlaylistWorkflow:
         if not draft:
             raise WorkflowError("No draft. Send a list of songs")
         return draft
-
-    @staticmethod
-    def _pending_at(
-        draft: Draft, index: int, revision: int | None = None, *, allow_waiting: bool = False
-    ) -> Track:
-        if draft.phase != "resolving" or not 0 <= index < len(draft.tracks) or draft.tracks[index].status != "pending":
-            raise WorkflowError("This selection is outdated; use /resume")
-        if revision is not None and draft.tracks[index].search_revision != revision:
-            raise WorkflowError("The search results have changed; use /resume")
-        if draft.tracks[index].await_query and not allow_waiting:
-            raise WorkflowError("Waiting for a new search query")
-        return draft.tracks[index]

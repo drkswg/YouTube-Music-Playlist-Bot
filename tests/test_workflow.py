@@ -7,6 +7,7 @@ from googleapiclient.errors import HttpError
 from httplib2 import Response
 
 from ym_playlist_maker.models import Candidate
+from ym_playlist_maker.selection import SelectionDecision
 from ym_playlist_maker.service import PlaylistWorkflow, UnconfirmedInsert, UncertainWrite, WorkflowError
 from ym_playlist_maker.store import DraftStore
 from ym_playlist_maker.youtube import BeforeCreateError, BeforeInsertError
@@ -84,12 +85,21 @@ class FakeYouTube:
             raise TimeoutError("lost response")
 
 
+class FakeSelector:
+    def __init__(self):
+        self.calls = []
+
+    def select(self, value):
+        self.calls.append(value)
+        return SelectionDecision(value.candidates[0].video_id, "preferred_release")
+
+
 @pytest.fixture
 def setup(tmp_path: Path, monkeypatch):
     store = DraftStore(tmp_path / "state.sqlite3")
     youtube = FakeYouTube()
     monkeypatch.setattr("ym_playlist_maker.service.sleep", lambda seconds: youtube.events.append(("sleep", seconds)))
-    workflow = PlaylistWorkflow(store, FakeSearch(), youtube)
+    workflow = PlaylistWorkflow(store, FakeSearch(), youtube, FakeSelector())
     yield workflow, youtube, store
     store.close()
 
@@ -97,11 +107,7 @@ def setup(tmp_path: Path, monkeypatch):
 def prepare(workflow):
     draft, invalid = workflow.start("Oasis — Wonderwall\nLinkin Park — Numb\nOasis — Wonderwall")
     assert not invalid
-    draft, index = workflow.next_unresolved()
-    assert index == 1  # first track was uniquely matched
-    workflow.choose(index, 0)
-    draft, index = workflow.next_unresolved()
-    assert index is None  # third track was auto matched
+    draft = workflow.resolve_pending()
     assert draft.phase == "title"
     return workflow.set_title("My songs")
 
@@ -137,7 +143,7 @@ def test_lost_create_response_reconciles_without_second_playlist(setup, tmp_path
     store.close()
     reopened = DraftStore(tmp_path / "state.sqlite3")
     try:
-        recovered = PlaylistWorkflow(reopened, FakeSearch(), youtube)
+        recovered = PlaylistWorkflow(reopened, FakeSearch(), youtube, FakeSelector())
         result = recovered.publish()
         assert result.phase == "done" and result.privacy == privacy
         assert youtube.created == [("playlist1", result.title, result.create_marker, privacy)]
@@ -162,7 +168,7 @@ def test_persisted_visibility_survives_store_restart(setup, tmp_path, legacy):
             db.execute("UPDATE draft SET data = ? WHERE slot = 1", (json.dumps(payload),))
     reopened = DraftStore(path)
     try:
-        recovered = PlaylistWorkflow(reopened, FakeSearch(), youtube)
+        recovered = PlaylistWorkflow(reopened, FakeSearch(), youtube, FakeSelector())
         privacy = "private" if legacy else "public"
         assert reopened.load().privacy == privacy
         result = recovered.publish()
@@ -211,7 +217,7 @@ def test_lost_add_response_reconciles_without_second_insert(setup):
         workflow.publish()
     assert workflow.active().phase == "writing"
     # A new workflow process can resume from the same durable database.
-    recovered = PlaylistWorkflow(store, FakeSearch(), youtube)
+    recovered = PlaylistWorkflow(store, FakeSearch(), youtube, FakeSelector())
     result = recovered.publish()
     assert result.phase == "done"
     assert youtube.items == ["oasis", "numb1"]
@@ -229,39 +235,14 @@ def test_unknown_create_without_remote_match_never_retries(setup):
     assert youtube.created == []
 
 
-def test_stale_choice_and_cancel_after_creation_rejected(setup):
+def test_cancel_after_creation_rejected(setup):
     workflow, youtube, _ = setup
     prepare(workflow)
-    with pytest.raises(WorkflowError):
-        workflow.choose(1, 0)
     youtube.fail_create_after_commit = True
     with pytest.raises(UncertainWrite):
         workflow.publish()
     with pytest.raises(WorkflowError):
         workflow.cancel()
-
-
-def test_old_search_buttons_cannot_pick_new_results(setup):
-    workflow, _, _ = setup
-    workflow.start("Linkin Park — Numb")
-    draft, index = workflow.next_unresolved()
-    revision = draft.tracks[index].search_revision
-    workflow.search_again(index, "Numb live")
-    with pytest.raises(WorkflowError):
-        workflow.choose(index, 0, revision)
-
-
-def test_buttons_invalid_while_waiting_for_new_query(setup):
-    workflow, _, _ = setup
-    workflow.start("Linkin Park — Numb")
-    draft, index = workflow.next_unresolved()
-    revision = draft.tracks[index].search_revision
-    workflow.request_search_again(index, revision)
-    with pytest.raises(WorkflowError):
-        workflow.choose(index, 0, revision)
-    with pytest.raises(WorkflowError):
-        workflow.skip(index)
-    assert workflow.active().tracks[index].await_query
 
 
 def test_before_dispatch_failure_can_resume_without_approval(setup):
@@ -378,7 +359,7 @@ def test_exhausted_read_preserves_error_and_resume_uses_same_playlist(setup):
     draft = workflow.active()
     assert draft.playlist_id == "playlist1" and draft.phase == "writing"
     assert all(track.insert_revision == 0 for track in draft.tracks)
-    recovered = PlaylistWorkflow(store, FakeSearch(), youtube)
+    recovered = PlaylistWorkflow(store, FakeSearch(), youtube, FakeSelector())
     assert recovered.publish().phase == "done"
     assert len(youtube.created) == 1
     assert youtube.events[-3:] == [("sleep", 1), ("read", "playlist1"), ("read", "playlist1")]
@@ -446,37 +427,15 @@ def test_studio_plus_live_auto_selects_and_persists(setup):
         Candidate("studio", "Numb", ["Linkin Park"], "Meteora"),
     ])
     workflow.start("Linkin Park — Numb")
-    draft, index = workflow.next_unresolved()
-    assert index is None and draft.phase == "title"
+    draft = workflow.resolve_pending()
+    assert draft.phase == "title"
     assert store.load().tracks[0].selected == "studio"
     assert [c.video_id for c in draft.tracks[0].candidates] == ["studio", "live"]
     assert draft.tracks[0].search_revision == 1
     assert youtube.items == []
 
 
-@pytest.mark.parametrize("query", ["Linkin Park Numb", "some custom query"])
-def test_custom_search_is_manual_in_raw_order_even_for_canonical_query(setup, query):
-    workflow, _, store = setup
-    workflow.start("Linkin Park — Numb")
-    draft, index = workflow.next_unresolved()
-    old_revision = draft.tracks[0].search_revision
-    workflow.search = StaticSearch([
-        Candidate("cover", "Numb", ["Another Artist"]),
-        Candidate("studio", "Numb", ["Linkin Park"]),
-    ])
-    draft = workflow.search_again(index, query)
-    assert draft.tracks[0].status == "pending" and draft.tracks[0].selected is None
-    assert draft.tracks[0].search_revision == old_revision + 1
-    assert [c.video_id for c in draft.tracks[0].candidates] == ["cover", "studio"]
-    recovered = PlaylistWorkflow(store, workflow.search, workflow.youtube)
-    snapshot, index = recovered.next_unresolved()
-    assert snapshot.to_dict() == draft.to_dict() and index == 0
-    with pytest.raises(WorkflowError, match="search results have changed"):
-        recovered.choose(0, 0, old_revision)
-    assert recovered.choose(0, 1, draft.tracks[0].search_revision).tracks[0].selected == "studio"
-
-
-def test_legacy_pending_snapshot_is_not_auto_selected_or_reordered(setup):
+def test_legacy_pending_snapshot_is_selected_from_stored_candidates_without_search(setup):
     workflow, _, store = setup
     draft, _ = workflow.start("Linkin Park — Numb")
     track = draft.tracks[0]
@@ -487,15 +446,14 @@ def test_legacy_pending_snapshot_is_not_auto_selected_or_reordered(setup):
     track.search_query = "Linkin Park Numb"
     track.search_revision = 7
     store.save(draft)
-    expected = draft.to_dict()
     workflow.search = StaticSearch([])
-    snapshot, index = workflow.next_unresolved()
-    assert index == 0 and snapshot.to_dict() == expected
+    snapshot = workflow.resolve_pending()
     assert workflow.search.calls == []
-    assert workflow.choose(0, 0, 7).tracks[0].selected == "live"
+    assert len(workflow.selector.calls) == 1
+    assert snapshot.tracks[0].selected == "live" and snapshot.tracks[0].search_revision == 7
 
 
-def test_fresh_search_ranks_late_relevant_results_before_persisting_buttons(setup):
+def test_fresh_search_ranks_late_relevant_results_before_selection(setup):
     workflow, _, store = setup
     covers = [Candidate(f"cover{i}", "Numb", ["Cover Artist"]) for i in range(8)]
     workflow.search = StaticSearch(covers + [
@@ -503,18 +461,17 @@ def test_fresh_search_ranks_late_relevant_results_before_persisting_buttons(setu
         Candidate("two", "Numb", ["Linkin Park"], duration="4:00"),
     ])
     workflow.start("Linkin Park — Numb")
-    draft, index = workflow.next_unresolved()
-    track = draft.tracks[index]
-    assert track.status == "pending" and len(track.candidates) == 10
+    draft = workflow.resolve_pending()
+    track = draft.tracks[0]
+    assert len(track.candidates) == 10
     assert [c.video_id for c in store.load().tracks[0].candidates[:2]] == ["one", "two"]
-    assert workflow.choose(index, 1, track.search_revision).tracks[index].selected == "two"
+    assert track.selected == "one" and draft.phase == "title"
 
 
 def test_search_failure_leaves_saved_snapshot_and_revision_intact(setup):
     workflow, _, store = setup
     workflow.start("Linkin Park — Numb")
-    draft, _ = workflow.next_unresolved()
-    expected = draft.to_dict()
+    expected = store.load().to_dict()
 
     class FailingSearch:
         def songs(self, query):
@@ -522,7 +479,7 @@ def test_search_failure_leaves_saved_snapshot_and_revision_intact(setup):
 
     workflow.search = FailingSearch()
     with pytest.raises(TimeoutError, match="offline"):
-        workflow.search_again(0, "new query")
+        workflow.resolve_pending()
     assert store.load().to_dict() == expected
 
 
@@ -536,7 +493,7 @@ def test_creation_preparation_failure_returns_to_editable_confirm(setup):
         workflow.publish()
     assert workflow.active().phase == "confirm"
     assert youtube.created == [] and youtube.items == []
-    assert workflow.edit(1).phase == "resolving"
+    assert workflow.edit(1, "Numb live").phase == "resolving"
     workflow.cancel()
     assert workflow.active() is None
 

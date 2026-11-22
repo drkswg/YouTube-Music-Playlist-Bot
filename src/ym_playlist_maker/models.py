@@ -24,7 +24,7 @@ class SelectionRecord:
     policy: str
     snapshot_hash: str
     search_revision: int
-    status: Literal["attempted", "selected", "abstained", "failed"] = "attempted"
+    status: Literal["attempted", "selected", "no_match", "failed"] = "attempted"
     selected_id: str | None = None
     reason: str | None = None
     error_code: str | None = None
@@ -42,8 +42,8 @@ class Track:
     search_query: str = ""
     search_revision: int = 0
     insert_revision: int = 0
-    await_query: bool = False
     selection_record: SelectionRecord | None = None
+    skip_reason: Literal["no_results", "no_match", "selection_failed"] | None = None
 
     @classmethod
     def from_dict(cls, value: dict) -> "Track":
@@ -51,6 +51,7 @@ class Track:
         if value.get("selection_record") is not None:
             value["selection_record"] = SelectionRecord(**value["selection_record"])
         value["candidates"] = [Candidate.from_dict(x) for x in value.get("candidates", [])]
+        value.pop("await_query", None)
         return cls(**value)
 
 

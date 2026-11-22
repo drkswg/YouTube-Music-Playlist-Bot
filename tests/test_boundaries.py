@@ -16,7 +16,7 @@ from ym_playlist_maker.models import Candidate, Draft, Track
 from ym_playlist_maker.service import UnconfirmedInsert
 from ym_playlist_maker.youtube import BeforeInsertError, MissingCredentials, YouTubePlaylists
 
-from test_workflow import FakeSearch, FakeYouTube, prepare
+from test_workflow import FakeSearch, FakeSelector, FakeYouTube, prepare
 
 
 class FakeCollection:
@@ -129,7 +129,7 @@ def test_application_startup_registers_owner_menu_for_all_command_handlers(monke
                for command in handler.commands}
     assert {command.command for command in registered} == handled
     assert all(command.description for command in registered)
-    assert "/edit <source line>" in next(command.description for command in registered if command.command == "edit")
+    assert "/edit <source line> <query>" in next(command.description for command in registered if command.command == "edit")
     assert commands.await_args.kwargs == {"scope": BotCommandScopeChat(123)}
     menu.assert_awaited_once_with(chat_id=123, menu_button=MenuButtonCommands())
 
@@ -192,67 +192,6 @@ def test_menu_failure_keeps_startup_and_start_help_available(monkeypatch, caplog
     assert "sensitive provider detail" not in caplog.text
 
 
-def test_candidate_message_shows_album_and_duration():
-    track = Track("Artist", "Song", 1, candidates=[Candidate("id", "Song", ["Artist"], "Album X", "3:42")])
-    track.search_query = "Artist Song"
-    draft = Draft("draft123", [track])
-    workflow = SimpleNamespace(next_unresolved=lambda: (draft, 0))
-    ui = BotUI(BotConfig("dummy", 123, Path("unused")), workflow)
-    message = CollectMessage()
-    asyncio.run(ui._show_state(SimpleNamespace(effective_message=message)))
-    assert "Album X" in message.sent[0][0]
-    assert "3:42" in message.sent[0][0]
-    assert "confirm a recording from the saved search results" in message.sent[0][0]
-
-
-@pytest.mark.parametrize("candidates,reason", [
-    ([Candidate("one", "Song", ["Artist"]), Candidate("two", "Song", ["Artist"])], "durations are missing"),
-    ([Candidate("one", "Song (Live)", ["Artist"])], "requested version was not found"),
-    ([Candidate("one", "Song (Demo)", ["Artist"])], "labels are unclear"),
-    ([Candidate("one", "Song", ["Cover Artist"])], "title and artist do not match"),
-    ([], "No matches"),
-])
-def test_resolution_message_explains_manual_selection(candidates, reason):
-    track = Track("Artist", "Song", 1, candidates=candidates, search_query="Artist Song", search_revision=3)
-    draft = Draft("draft123", [track])
-    before = draft.to_dict()
-    ui = BotUI(BotConfig("dummy", 123, Path("unused")), SimpleNamespace(next_unresolved=lambda: (draft, 0)))
-    message = CollectMessage()
-    asyncio.run(ui._show_state(SimpleNamespace(effective_message=message)))
-    assert reason in message.sent[0][0]
-    assert draft.to_dict() == before
-
-
-def test_hidden_results_and_button_indices_use_persisted_snapshot():
-    candidates = [Candidate(f"id{i}", "Song", ["Artist"], duration=f"3:{40 + i}") for i in range(10)]
-    track = Track("Artist", "Song", 1, candidates=candidates, search_query="Artist Song", search_revision=9)
-    draft = Draft("draft123", [track])
-    before = draft.to_dict()
-    ui = BotUI(BotConfig("dummy", 123, Path("unused")), SimpleNamespace(next_unresolved=lambda: (draft, 0)))
-    message = CollectMessage()
-    asyncio.run(ui._show_state(SimpleNamespace(effective_message=message)))
-    text, options = message.sent[0]
-    assert "different durations" in text
-    assert "Showing 5 of 10 results; 5 more are hidden" in text
-    assert [row[0].callback_data for row in options["reply_markup"].inline_keyboard[:5]] == [
-        f"d:draft123:pick:0:9:{i}" for i in range(5)
-    ]
-    assert draft.to_dict() == before
-
-
-def test_ui_preserves_legacy_order_when_new_rules_would_choose_studio():
-    track = Track("Artist", "Song", 1, candidates=[
-        Candidate("live", "Song (Live)", ["Artist"]), Candidate("studio", "Song", ["Artist"]),
-    ], search_query="Artist Song", search_revision=4)
-    draft = Draft("draft123", [track])
-    ui = BotUI(BotConfig("dummy", 123, Path("unused")), SimpleNamespace(next_unresolved=lambda: (draft, 0)))
-    message = CollectMessage()
-    asyncio.run(ui._show_state(SimpleNamespace(effective_message=message)))
-    text, options = message.sent[0]
-    assert "confirm a recording from the saved search results" in text
-    assert text.index("1. Song (Live)") < text.index("2. Song")
-    assert options["reply_markup"].inline_keyboard[0][0].callback_data == "d:draft123:pick:0:4:0"
-
 
 def test_confirmation_lists_every_selection_in_telegram_safe_chunks():
     tracks = []
@@ -260,7 +199,7 @@ def test_confirmation_lists_every_selection_in_telegram_safe_chunks():
         candidate = Candidate(f"id{i}", "Long Song Title " * 5, ["Artist"], "Album", "4:12")
         tracks.append(Track("Artist", "Song", i + 1, candidates=[candidate], selected=candidate.video_id, status="selected"))
     draft = Draft("draft123", tracks, phase="confirm", title="Many songs")
-    workflow = SimpleNamespace(next_unresolved=lambda: (draft, None))
+    workflow = SimpleNamespace(resolve_pending=lambda **kwargs: draft)
     ui = BotUI(BotConfig("dummy", 123, Path("unused")), workflow)
     message = CollectMessage()
     asyncio.run(ui._show_state(SimpleNamespace(effective_message=message)))
@@ -279,7 +218,7 @@ def review_ui(tmp_path, monkeypatch):
     monkeypatch.setattr("ym_playlist_maker.service.sleep", lambda _: None)
     store = DraftStore(tmp_path / "state.sqlite3")
     youtube = FakeYouTube()
-    workflow = PlaylistWorkflow(store, FakeSearch(), youtube)
+    workflow = PlaylistWorkflow(store, FakeSearch(), youtube, FakeSelector())
     prepare(workflow)
     ui = BotUI(BotConfig("dummy", 123, Path("unused")), workflow)
     yield ui, youtube, store
@@ -343,26 +282,21 @@ def test_invalid_create_callbacks_never_mutate_draft(review_ui, template, error)
 
 
 @pytest.mark.parametrize("privacy", ["private", "public"])
-def test_create_callbacks_are_stale_during_and_after_edit(review_ui, privacy):
+def test_create_callbacks_are_stale_after_edit(review_ui, privacy):
     ui, youtube, store = review_ui
     review = review_update()
     asyncio.run(ui.resume(review, None))
     rows = review.effective_message.sent[-1][1]["reply_markup"].inline_keyboard
     callback_data = rows[privacy == "public"][0].callback_data
     edit = review_update()
-    asyncio.run(ui.edit(edit, SimpleNamespace(args=["2"])))
-    assert store.load().phase == "resolving"
-    pick_rows = edit.effective_message.sent[-1][1]["reply_markup"].inline_keyboard
-    for resolved in (False, True):
-        if resolved:
-            asyncio.run(ui.callback(review_update(pick_rows[0][0].callback_data), None))
-            assert store.load().phase == "confirm"
-        saved = store.load().to_dict()
-        update = review_update(callback_data)
-        asyncio.run(ui.callback(update, None))
-        assert "This review is outdated" in update.effective_message.sent[-1][0]
-        assert store.load().to_dict() == saved
-        assert youtube.created == [] and youtube.items == [] and youtube.item_reads == 0
+    asyncio.run(ui.edit(edit, SimpleNamespace(args=["2", "Numb", "live"])))
+    assert store.load().phase == "confirm"
+    saved = store.load().to_dict()
+    update = review_update(callback_data)
+    asyncio.run(ui.callback(update, None))
+    assert "This review is outdated" in update.effective_message.sent[-1][0]
+    assert store.load().to_dict() == saved
+    assert youtube.created == [] and youtube.items == [] and youtube.item_reads == 0
 
 
 def test_unconfirmed_insert_shows_explicit_retry_button():
@@ -571,36 +505,19 @@ def test_shared_sender_preserves_text_and_keyboard_on_last_fragment(text):
     assert message.sent[-1][1] == {"reply_markup": keyboard}
 
 
-def test_long_candidates_are_delivered_with_unchanged_button_revision():
-    candidate = Candidate("id", "Song" + "X" * 5000, ["Artist"], "Album" + "Y" * 3000)
-    track = Track("Artist", "Song" + "Z" * 4090, 1, candidates=[candidate], search_revision=7,
-                  search_query="saved")
-    draft = Draft("draft123", [track])
-    ui = BotUI(BotConfig("dummy", 123, Path("unused")), SimpleNamespace(next_unresolved=lambda: (draft, 0)))
-    message = CollectMessage()
-    asyncio.run(ui._show_state(SimpleNamespace(effective_message=message)))
-    text = "".join(part for part, _ in message.sent)
-    assert candidate.title in text and candidate.album in text and track.title in text
-    assert all(len(part.encode("utf-16-le")) // 2 <= 3500 for part, _ in message.sent)
-    assert all("reply_markup" not in kwargs for _, kwargs in message.sent[:-1])
-    keyboard = message.sent[-1][1]["reply_markup"]
-    assert keyboard.inline_keyboard[0][0].callback_data == "d:draft123:pick:0:7:0"
-
-
 @pytest.mark.parametrize("user_id,draft_id", [(123, "current"), (456, "current"), (123, "stale")])
 def test_failed_callback_ack_does_not_bypass_access_or_draft_checks(user_id, draft_id, caplog):
-    chosen = []
+    cancelled = []
     draft = Draft("current", [Track("Artist", "Song", 1)])
-    workflow = SimpleNamespace(active=lambda: draft, choose=lambda *args: chosen.append(args),
-                               next_unresolved=lambda: (Draft("current", [], phase="title"), None))
+    workflow = SimpleNamespace(active=lambda: draft, cancel=lambda: cancelled.append(True))
     ui = BotUI(BotConfig("dummy", 123, Path("unused")), workflow)
     message = CollectMessage()
     update = SimpleNamespace(effective_user=SimpleNamespace(id=user_id),
                              effective_chat=SimpleNamespace(type=ChatType.PRIVATE), effective_message=message,
-                             callback_query=SimpleNamespace(data=f"d:{draft_id}:pick:0:3:0",
+                             callback_query=SimpleNamespace(data=f"d:{draft_id}:cancel",
                                  answer=AsyncMock(side_effect=BadRequest("SYNTHETIC_SECRET"))))
     asyncio.run(ui.callback(update, None))
-    assert chosen == ([(0, 0, 3)] if user_id == 123 and draft_id == "current" else [])
+    assert cancelled == ([True] if user_id == 123 and draft_id == "current" else [])
     assert "SYNTHETIC_SECRET" not in caplog.text + str(message.sent)
 
 
