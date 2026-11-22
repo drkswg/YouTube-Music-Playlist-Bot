@@ -16,7 +16,7 @@ from telegram.ext import Application, CallbackQueryHandler, CommandHandler, Cont
 from .config import BotConfig
 from .i18n import LANGUAGES, translate, translate_saved_message, safe_workflow_message
 from .models import Draft, selected_candidate
-from .service import PlaylistWorkflow, UnconfirmedInsert, UncertainWrite, WorkflowError
+from .service import ALL_SKIPPED, PlaylistWorkflow, UnconfirmedInsert, UncertainWrite, WorkflowError
 from .youtube import MissingCredentials, http_error_reason
 
 log = logging.getLogger(__name__)
@@ -257,7 +257,6 @@ class BotUI:
                     return
                 else:
                     raise WorkflowError("Invalid button")
-                await self._show_state(update)
             except (ValueError, IndexError):
                 await self._send_text(update, self._t("Invalid button; use /resume."))
             except Exception as exc:
@@ -308,10 +307,16 @@ class BotUI:
                 log.warning("Could not send recording selection progress")
 
         draft = await asyncio.to_thread(self.workflow.resolve_pending, on_selection_pending=progress)
-        if draft.phase == "title":
-            await self._send_text(update, self._t("Selection complete. Send a title for the new playlist."))
+        selected = [t for t in draft.tracks if t.status == "selected"]
+        if draft.phase in ("title", "confirm") and not selected:
+            # Nothing to create; keep /edit available and explain every skipped line.
+            cancel = InlineKeyboardButton(self._t("Cancel"), callback_data=f"d:{draft.draft_id}:cancel")
+            await self._send_text(update, "\n".join(self._skip_report(draft) + [self._t(ALL_SKIPPED)]),
+                                  reply_markup=InlineKeyboardMarkup([[cancel]]))
+        elif draft.phase == "title":
+            await self._send_lines(update, self._skip_report(draft)
+                                   + [self._t("Selection complete. Send a title for the new playlist.")])
         elif draft.phase == "confirm":
-            selected = [t for t in draft.tracks if t.status == "selected"]
             skipped = [t.source_line for t in draft.tracks if t.status == "skipped" and t.skip_reason is None]
             lines: list[str] = []
             seen: set[str] = set()
@@ -362,7 +367,7 @@ class BotUI:
         messages = {
             "no_results": "Line {line} ({artist} — {title}): no search results, skipped",
             "no_match": "Line {line} ({artist} — {title}): no matching recording found, skipped",
-            "selection_failed": "Line {line} ({artist} — {title}): automatic selection failed after 3 attempts, skipped",
+            "selection_failed": "Line {line} ({artist} — {title}): automatic selection failed, skipped",
         }
         return [self._t(messages[t.skip_reason], line=t.source_line, artist=t.artist, title=t.title)
                 for t in draft.tracks if t.status == "skipped" and t.skip_reason in messages]

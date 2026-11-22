@@ -205,10 +205,19 @@ _CATALOG: dict[str, tuple[str, ...]] = {
         "Ya existe un borrador. Usa /resume o /cancel", "Ein Entwurf existiert bereits. Nutze /resume oder /cancel",
         "Un brouillon existe déjà. Utilisez /resume ou /cancel", "Já existe um rascunho. Use /resume ou /cancel",
     ),
-    "All songs have been skipped; use /cancel": (
-        "Все песни пропущены; используйте /cancel", "Se omitieron todas las canciones; usa /cancel",
-        "Alle Titel wurden übersprungen; nutze /cancel", "Toutes les chansons ont été ignorées ; utilisez /cancel",
-        "Todas as músicas foram ignoradas; use /cancel",
+    "All songs have been skipped. Use /edit <source line> <search query> to search again or /cancel": (
+        "Все песни пропущены. Используйте /edit <номер строки> <запрос>, чтобы искать снова, или /cancel",
+        "Se omitieron todas las canciones. Usa /edit <número de línea> <búsqueda> para buscar de nuevo o /cancel",
+        "Alle Titel wurden übersprungen. Nutze /edit <Zeilennummer> <Suchanfrage> für eine neue Suche oder /cancel",
+        "Toutes les chansons ont été ignorées. Utilisez /edit <numéro de ligne> <recherche> pour relancer la recherche ou /cancel",
+        "Todas as músicas foram ignoradas. Use /edit <número da linha> <pesquisa> para pesquisar novamente ou /cancel",
+    ),
+    "Gemini rejected the API key. Check GEMINI_API_KEY, restart the bot and use /resume": (
+        "Gemini отклонил API-ключ. Проверьте GEMINI_API_KEY, перезапустите бота и используйте /resume",
+        "Gemini rechazó la clave de API. Revisa GEMINI_API_KEY, reinicia el bot y usa /resume",
+        "Gemini hat den API-Schlüssel abgelehnt. Prüfe GEMINI_API_KEY, starte den Bot neu und nutze /resume",
+        "Gemini a refusé la clé d’API. Vérifiez GEMINI_API_KEY, redémarrez le bot et utilisez /resume",
+        "O Gemini rejeitou a chave de API. Verifique GEMINI_API_KEY, reinicie o bot e use /resume",
     ),
     "Enter a search query between 1 and 200 characters long": (
         "Введите поисковый запрос длиной от 1 до 200 символов", "Introduce una búsqueda de entre 1 y 200 caracteres",
@@ -405,12 +414,12 @@ _CATALOG.update({
         "Ligne {line} ({artist} — {title}) : aucun enregistrement correspondant trouvé, ignorée",
         "Linha {line} ({artist} — {title}): nenhuma gravação correspondente encontrada, ignorada",
     ),
-    "Line {line} ({artist} — {title}): automatic selection failed after 3 attempts, skipped": (
-        "Строка {line} ({artist} — {title}): автоматический выбор не удался после 3 попыток, пропущена",
-        "Línea {line} ({artist} — {title}): la selección automática falló tras 3 intentos, omitida",
-        "Zeile {line} ({artist} — {title}): automatische Auswahl nach 3 Versuchen fehlgeschlagen, übersprungen",
-        "Ligne {line} ({artist} — {title}) : la sélection automatique a échoué après 3 tentatives, ignorée",
-        "Linha {line} ({artist} — {title}): a seleção automática falhou após 3 tentativas, ignorada",
+    "Line {line} ({artist} — {title}): automatic selection failed, skipped": (
+        "Строка {line} ({artist} — {title}): автоматический выбор не удался, пропущена",
+        "Línea {line} ({artist} — {title}): la selección automática falló, omitida",
+        "Zeile {line} ({artist} — {title}): automatische Auswahl fehlgeschlagen, übersprungen",
+        "Ligne {line} ({artist} — {title}) : la sélection automatique a échoué, ignorée",
+        "Linha {line} ({artist} — {title}): a seleção automática falhou, ignorada",
     ),
 })
 

@@ -55,7 +55,7 @@ class FakeSelector:
 
 
 def make_ui(store):
-    return BotUI(BotConfig("dummy", 123, Path("unused")), PlaylistWorkflow(store, search=None, youtube=None, selector=FakeSelector()))
+    return BotUI(BotConfig("dummy", 123, Path("unused"), "gemini"), PlaylistWorkflow(store, search=None, youtube=None, selector=FakeSelector()))
 
 
 def test_language_picker_uses_native_names_and_current_choice_without_a_draft(tmp_path):
@@ -219,7 +219,7 @@ def test_localized_review_actions_remain_usable(tmp_path, monkeypatch, code, act
     workflow = PlaylistWorkflow(store, FakeSearch(), youtube, FakeSelector())
     draft = prepare(workflow)
     before = draft.to_dict()
-    ui = BotUI(BotConfig("dummy", 123, Path("unused")), workflow)
+    ui = BotUI(BotConfig("dummy", 123, Path("unused"), "gemini"), workflow)
     update = make_update()
     asyncio.run(ui.resume(update, None))
     rows = update.effective_message.sent[-1][1]["reply_markup"].inline_keyboard
@@ -351,3 +351,27 @@ def test_old_duplicate_diagnostic_is_localized(language):
     source = "Line 17: duplicate recording skipped"
     translated = translate_saved_message(language, source)
     assert translated != source and "17" in translated
+
+
+@pytest.mark.parametrize("language", ["ru", "es", "de", "fr", "pt"])
+def test_skip_report_and_selection_errors_are_localized(tmp_path, language):
+    store = DraftStore(tmp_path / "state.sqlite3")
+    store.set_language(language)
+    ui = make_ui(store)
+    english = make_ui(DraftStore(tmp_path / "english.sqlite3"))
+    english.language_code = "en"
+    reasons = ["no_results", "no_match", "selection_failed"]
+    draft = Draft("d", [Track("Oasis", "Wonderwall", i + 1, status="skipped", skip_reason=reason)
+                        for i, reason in enumerate(reasons)], phase="confirm", title="T")
+    report = ui._skip_report(draft)
+    assert len(report) == 3 and len(set(report)) == 3
+    for line, (number, source) in zip(report, enumerate(english._skip_report(draft), 1)):
+        assert line != source and str(number) in line and "Oasis — Wonderwall" in line
+    for message in ("All songs have been skipped. Use /edit <source line> <search query> to search again or /cancel",
+                    "Gemini rejected the API key. Check GEMINI_API_KEY, restart the bot and use /resume"):
+        update = make_update()
+        asyncio.run(ui._error(update, WorkflowError(message)))
+        text = update.effective_message.sent[0][0]
+        assert message not in text and ("GEMINI_API_KEY" in text or "/edit" in text)
+    english.store.close()
+    store.close()

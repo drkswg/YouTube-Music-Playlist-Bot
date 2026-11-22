@@ -86,7 +86,7 @@ def test_youtube_preparation_failure_is_marked_not_dispatched():
 
 
 def test_ui_rejects_other_user_and_group_chat():
-    ui = BotUI(BotConfig("dummy", 123, Path("unused")), workflow=None)
+    ui = BotUI(BotConfig("dummy", 123, Path("unused"), "gemini"), workflow=None)
     own_private = SimpleNamespace(
         effective_user=SimpleNamespace(id=123),
         effective_chat=SimpleNamespace(type=ChatType.PRIVATE),
@@ -117,7 +117,7 @@ def test_application_startup_registers_owner_menu_for_all_command_handlers(monke
     menu = AsyncMock()
     monkeypatch.setattr("telegram.ext.ExtBot.set_my_commands", commands)
     monkeypatch.setattr("telegram.ext.ExtBot.set_chat_menu_button", menu)
-    app = build_application(BotConfig("123:dummy", 123, Path("unused")), workflow=None)
+    app = build_application(BotConfig("123:dummy", 123, Path("unused"), "gemini"), workflow=None)
 
     assert app.post_init is not None
     asyncio.run(app.post_init(app))
@@ -141,7 +141,7 @@ def test_application_startup_registers_owner_menu_for_all_command_handlers(monke
 ])
 def test_start_configures_menu_only_for_owner_private_chat(user_id, chat_type, allowed):
     bot = SimpleNamespace(set_my_commands=AsyncMock(), set_chat_menu_button=AsyncMock())
-    ui = BotUI(BotConfig("dummy", 123, Path("unused")), workflow=None)
+    ui = BotUI(BotConfig("dummy", 123, Path("unused"), "gemini"), workflow=None)
     message = CollectMessage()
     update = SimpleNamespace(
         effective_user=SimpleNamespace(id=user_id),
@@ -169,7 +169,7 @@ def test_menu_failure_keeps_startup_and_start_help_available(monkeypatch, caplog
     methods[failed_method].side_effect = BadRequest("chat not found: sensitive provider detail")
     for name, method in methods.items():
         monkeypatch.setattr(f"telegram.ext.ExtBot.{name}", method)
-    app = build_application(BotConfig("123:dummy", 123, Path("unused")), workflow=None)
+    app = build_application(BotConfig("123:dummy", 123, Path("unused"), "gemini"), workflow=None)
     message = CollectMessage()
     update = SimpleNamespace(
         effective_user=SimpleNamespace(id=123),
@@ -200,7 +200,7 @@ def test_confirmation_lists_every_selection_in_telegram_safe_chunks():
         tracks.append(Track("Artist", "Song", i + 1, candidates=[candidate], selected=candidate.video_id, status="selected"))
     draft = Draft("draft123", tracks, phase="confirm", title="Many songs")
     workflow = SimpleNamespace(resolve_pending=lambda **kwargs: draft)
-    ui = BotUI(BotConfig("dummy", 123, Path("unused")), workflow)
+    ui = BotUI(BotConfig("dummy", 123, Path("unused"), "gemini"), workflow)
     message = CollectMessage()
     asyncio.run(ui._show_state(SimpleNamespace(effective_message=message)))
     assert len(message.sent) > 2
@@ -220,7 +220,7 @@ def review_ui(tmp_path, monkeypatch):
     youtube = FakeYouTube()
     workflow = PlaylistWorkflow(store, FakeSearch(), youtube, FakeSelector())
     prepare(workflow)
-    ui = BotUI(BotConfig("dummy", 123, Path("unused")), workflow)
+    ui = BotUI(BotConfig("dummy", 123, Path("unused"), "gemini"), workflow)
     yield ui, youtube, store
     store.close()
 
@@ -299,10 +299,92 @@ def test_create_callbacks_are_stale_after_edit(review_ui, privacy):
     assert youtube.created == [] and youtube.items == [] and youtube.item_reads == 0
 
 
+@pytest.mark.parametrize("action", ["pick:0:0", "pick:1:numb2", "skip:1", "retry:1", "search:1"])
+def test_removed_manual_selection_buttons_never_mutate_draft(review_ui, action):
+    ui, youtube, store = review_ui
+    saved = store.load().to_dict()
+    update = review_update(f"d:{saved['draft_id']}:{action}")
+    asyncio.run(ui.callback(update, None))
+    assert "Invalid button" in update.effective_message.sent[-1][0]
+    assert store.load().to_dict() == saved
+    assert youtube.created == [] and youtube.items == [] and youtube.item_reads == 0
+
+
+class OutcomeSelector:
+    """Selects Wonderwall, finds no match for the live request and rejects Numb permanently."""
+
+    def select(self, value):
+        from ym_playlist_maker.selection import SelectionDecision, SelectionError
+        if value.title == "Numb":
+            raise SelectionError("http_404")
+        if value.title == "Wonderwall Live":
+            return SelectionDecision(None, "no_match")
+        return SelectionDecision(value.candidates[0].video_id, "preferred_release")
+
+
+def skip_ui(tmp_path, monkeypatch, selector):
+    from ym_playlist_maker.service import PlaylistWorkflow
+    from ym_playlist_maker.store import DraftStore
+
+    monkeypatch.setattr("ym_playlist_maker.service.sleep", lambda _: None)
+    store = DraftStore(tmp_path / "state.sqlite3")
+    youtube = FakeYouTube()
+    ui = BotUI(BotConfig("dummy", 123, Path("unused"), "gemini"),
+               PlaylistWorkflow(store, FakeSearch(), youtube, selector))
+    return ui, youtube, store
+
+
+def send_text(ui, text):
+    update = review_update()
+    update.effective_message.text = text
+    asyncio.run(ui.text(update, None))
+    return update.effective_message.sent
+
+
+def test_skip_report_is_shown_at_title_review_and_final_message(tmp_path, monkeypatch):
+    ui, youtube, store = skip_ui(tmp_path, monkeypatch, OutcomeSelector())
+    report = [
+        "Line 2 (Nobody — Nothing): no search results, skipped",
+        "Line 3 (Linkin Park — Numb): automatic selection failed, skipped",
+        "Line 4 (Oasis — Wonderwall Live): no matching recording found, skipped",
+    ]
+    sent = send_text(ui, "Oasis — Wonderwall\nNobody — Nothing\nLinkin Park — Numb\nOasis — Wonderwall Live")
+    assert sent[-1][0] == "\n".join(report + ["Selection complete. Send a title for the new playlist."])
+    sent = send_text(ui, "Mix")
+    review = "\n".join(text for text, _ in sent)
+    assert all(line in review for line in report) and "1. Wonderwall — Oasis" in review
+    create = sent[-1][1]["reply_markup"].inline_keyboard[0][0].callback_data
+    done = review_update(create)
+    asyncio.run(ui.callback(done, None))
+    final = done.effective_message.sent[-1][0]
+    assert final.startswith("Done: 1 songs.") and all(line in final for line in report)
+    assert youtube.items == ["oasis"]
+    store.close()
+
+
+def test_all_skipped_list_reports_lines_and_recovers_with_edit(tmp_path, monkeypatch):
+    ui, youtube, store = skip_ui(tmp_path, monkeypatch, FakeSelector())
+    sent = send_text(ui, "Nobody — Nothing\nSomebody — Silence")
+    text, options = sent[-1]
+    assert text.splitlines() == [
+        "Line 1 (Nobody — Nothing): no search results, skipped",
+        "Line 2 (Somebody — Silence): no search results, skipped",
+        "All songs have been skipped. Use /edit <source line> <search query> to search again or /cancel",
+    ]
+    buttons = [button for row in options["reply_markup"].inline_keyboard for button in row]
+    assert [button.text for button in buttons] == ["Cancel"]
+    edit = review_update()
+    asyncio.run(ui.edit(edit, SimpleNamespace(args=["2", "Oasis", "Wonderwall"])))
+    assert edit.effective_message.sent[-1][0].endswith("Selection complete. Send a title for the new playlist.")
+    assert store.load().phase == "title" and store.load().tracks[1].selected == "oasis"
+    assert youtube.created == []
+    store.close()
+
+
 def test_unconfirmed_insert_shows_explicit_retry_button():
     draft = Draft("draft123", [Track("A", "B", 1, status="uncertain", selected="id")], phase="writing", playlist_id="PL123")
     workflow = SimpleNamespace(active=lambda: draft)
-    ui = BotUI(BotConfig("dummy", 123, Path("unused")), workflow)
+    ui = BotUI(BotConfig("dummy", 123, Path("unused"), "gemini"), workflow)
     message = CollectMessage()
     asyncio.run(ui._error(SimpleNamespace(effective_message=message), UnconfirmedInsert(0, 1, 2)))
     assert "make sure" in message.sent[0][0]
@@ -343,7 +425,7 @@ def test_publish_ui_delivers_progress_on_loop_before_result(entry, failed):
             return draft
 
         workflow = SimpleNamespace(active=lambda: draft, publish=publish)
-        ui = BotUI(BotConfig("dummy", 123, Path("unused")), workflow)
+        ui = BotUI(BotConfig("dummy", 123, Path("unused"), "gemini"), workflow)
 
         async def answer():
             pass
@@ -383,7 +465,7 @@ def test_progress_delivery_failure_does_not_replace_publish_outcome(outcome, cap
             raise original
         return draft
 
-    ui = BotUI(BotConfig("dummy", 123, Path("unused")), SimpleNamespace(publish=publish))
+    ui = BotUI(BotConfig("dummy", 123, Path("unused"), "gemini"), SimpleNamespace(publish=publish))
     update = SimpleNamespace(effective_message=Message())
     if outcome == "failure":
         with pytest.raises(RuntimeError) as caught:
@@ -420,7 +502,7 @@ def test_progress_delivery_timeout_cancels_notification_without_failing_publish(
         on_playlist_pending()
         return draft
 
-    ui = BotUI(BotConfig("dummy", 123, Path("unused")), SimpleNamespace(publish=publish))
+    ui = BotUI(BotConfig("dummy", 123, Path("unused"), "gemini"), SimpleNamespace(publish=publish))
     assert asyncio.run(ui._publish(SimpleNamespace(effective_message=CollectMessage()))) is draft
     assert futures[0].cancelled
     assert "Could not send playlist creation progress" in caplog.text
@@ -456,7 +538,7 @@ def test_creation_boundary_distinguishes_prepare_from_dispatch(boundary):
 def test_workflow_errors_never_print_chained_provider_secrets(caplog, exception):
     exception.__cause__ = ValueError("SYNTHETIC_SECRET")
     draft = Draft("draft123", [])
-    ui = BotUI(BotConfig("SYNTHETIC_SECRET", 123, Path("unused")), SimpleNamespace(active=lambda: draft))
+    ui = BotUI(BotConfig("SYNTHETIC_SECRET", 123, Path("unused"), "gemini"), SimpleNamespace(active=lambda: draft))
     message = CollectMessage()
     asyncio.run(ui._error(SimpleNamespace(effective_message=message), exception))
     assert "SYNTHETIC_SECRET" not in caplog.text
@@ -468,7 +550,7 @@ def test_workflow_errors_never_print_chained_provider_secrets(caplog, exception)
 
 def test_unknown_workflow_message_is_not_trusted(caplog):
     from ym_playlist_maker.service import WorkflowError
-    ui = BotUI(BotConfig("dummy", 123, Path("unused")), None)
+    ui = BotUI(BotConfig("dummy", 123, Path("unused"), "gemini"), None)
     message = CollectMessage()
     asyncio.run(ui._error(SimpleNamespace(effective_message=message), WorkflowError("SYNTHETIC_SECRET")))
     assert "SYNTHETIC_SECRET" not in caplog.text + str(message.sent)
@@ -477,7 +559,7 @@ def test_unknown_workflow_message_is_not_trusted(caplog):
 def test_global_error_handler_registered_and_contains_notification_failure(monkeypatch, caplog):
     from telegram import Chat, Message, User, Update
     from datetime import datetime, timezone
-    app = build_application(BotConfig("123:dummy", 123, Path("unused")), None)
+    app = build_application(BotConfig("123:dummy", 123, Path("unused"), "gemini"), None)
     assert len(app.error_handlers) == 1
     handler = next(iter(app.error_handlers))
     update = Update(1, message=Message(1, datetime.now(timezone.utc), Chat(123, "private"),
@@ -495,7 +577,7 @@ def test_global_error_handler_registered_and_contains_notification_failure(monke
 @pytest.mark.parametrize("text", ["A" * 10001, "😀" * 5000, "first\n" + "B" * 4000 + "\nlast"],
                          ids=["long-line", "astral-unicode", "multiline"])
 def test_shared_sender_preserves_text_and_keyboard_on_last_fragment(text):
-    ui = BotUI(BotConfig("dummy", 123, Path("unused")), None)
+    ui = BotUI(BotConfig("dummy", 123, Path("unused"), "gemini"), None)
     message = CollectMessage()
     keyboard = object()
     asyncio.run(ui._send_text(SimpleNamespace(effective_message=message), text, reply_markup=keyboard))
@@ -510,7 +592,7 @@ def test_failed_callback_ack_does_not_bypass_access_or_draft_checks(user_id, dra
     cancelled = []
     draft = Draft("current", [Track("Artist", "Song", 1)])
     workflow = SimpleNamespace(active=lambda: draft, cancel=lambda: cancelled.append(True))
-    ui = BotUI(BotConfig("dummy", 123, Path("unused")), workflow)
+    ui = BotUI(BotConfig("dummy", 123, Path("unused"), "gemini"), workflow)
     message = CollectMessage()
     update = SimpleNamespace(effective_user=SimpleNamespace(id=user_id),
                              effective_chat=SimpleNamespace(type=ChatType.PRIVATE), effective_message=message,
@@ -532,7 +614,7 @@ def _diagnostic_http_error(reason, status=403):
 
 def test_quota_and_permission_errors_have_distinct_actionable_safe_diagnostics(caplog):
     draft = Draft("draft123", [], phase="confirm")
-    ui = BotUI(BotConfig("dummy", 123, Path("unused")), SimpleNamespace(active=lambda: draft))
+    ui = BotUI(BotConfig("dummy", 123, Path("unused"), "gemini"), SimpleNamespace(active=lambda: draft))
     message = CollectMessage()
     for reason in ("quotaExceeded", "insufficientPermissions"):
         exc = _diagnostic_http_error(reason)
@@ -566,7 +648,7 @@ def test_actionable_external_errors_are_localized_and_do_not_reveal_provider_tex
         "quota": _diagnostic_http_error("quotaExceeded"),
         "permissions": _diagnostic_http_error("insufficientPermissions"),
     }
-    ui = BotUI(BotConfig("dummy", 123, Path("unused")), None)
+    ui = BotUI(BotConfig("dummy", 123, Path("unused"), "gemini"), None)
     ui.language_code = language
     message = CollectMessage()
     exc = errors[kind]
@@ -583,7 +665,7 @@ def test_actionable_external_errors_are_localized_and_do_not_reveal_provider_tex
 
 def test_unknown_http_reason_body_and_draft_metadata_remain_hidden(caplog):
     draft = Draft("draft123", [], phase="SYNTHETIC_SECRET")
-    ui = BotUI(BotConfig("dummy", 123, Path("unused")), SimpleNamespace(active=lambda: draft))
+    ui = BotUI(BotConfig("dummy", 123, Path("unused"), "gemini"), SimpleNamespace(active=lambda: draft))
     message = CollectMessage()
     exc = _diagnostic_http_error("SYNTHETIC_SECRET")
     exc.__cause__ = RuntimeError("SYNTHETIC_SECRET")
@@ -597,7 +679,7 @@ def test_unknown_http_reason_body_and_draft_metadata_remain_hidden(caplog):
 def test_uncertain_insertion_diagnostics_include_known_phase_and_source_line(caplog):
     from ym_playlist_maker.service import UncertainWrite
     draft = Draft("draft123", [Track("Artist", "Song", 17)], phase="writing")
-    ui = BotUI(BotConfig("dummy", 123, Path("unused")), SimpleNamespace(active=lambda: draft))
+    ui = BotUI(BotConfig("dummy", 123, Path("unused"), "gemini"), SimpleNamespace(active=lambda: draft))
     message = CollectMessage()
     exc = UncertainWrite("The outcome of inserting line 17 is unknown; use /resume")
     exc.__cause__ = TimeoutError("SYNTHETIC_SECRET")
@@ -609,7 +691,7 @@ def test_uncertain_insertion_diagnostics_include_known_phase_and_source_line(cap
 def test_broken_storage_does_not_prevent_actionable_error_notification(caplog):
     def active():
         raise RuntimeError("SYNTHETIC_SECRET")
-    ui = BotUI(BotConfig("dummy", 123, Path("unused")), SimpleNamespace(active=active))
+    ui = BotUI(BotConfig("dummy", 123, Path("unused"), "gemini"), SimpleNamespace(active=active))
     message = CollectMessage()
     asyncio.run(ui._error(SimpleNamespace(effective_message=message), MissingCredentials("SYNTHETIC_SECRET")))
     assert "Repeat authorization" in message.sent[0][0]

@@ -18,7 +18,7 @@ class BotConfig:
     token: str = field(repr=False)
     owner_id: int
     directory: Path
-    gemini_api_key: str = field(default="", repr=False)
+    gemini_api_key: str = field(repr=False)
 
 
 def bot_config() -> BotConfig:

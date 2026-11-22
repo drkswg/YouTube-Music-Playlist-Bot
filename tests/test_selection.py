@@ -1,4 +1,4 @@
-"""Offline contracts for optional release selection and review editing."""
+"""Offline contracts for Gemini release selection and review editing."""
 import asyncio
 import io
 import json
@@ -17,7 +17,7 @@ from ym_playlist_maker.config import BotConfig, bot_config
 from ym_playlist_maker.models import Candidate, Draft, Track
 from ym_playlist_maker.parser import eligible_candidates, resolve_candidates
 from ym_playlist_maker.selection import GeminiSelector, SelectionDecision, SelectionError, SelectionInput
-from ym_playlist_maker.service import PlaylistWorkflow, WorkflowError
+from ym_playlist_maker.service import SELECTION_RETRY_DELAY, PlaylistWorkflow, WorkflowError
 from ym_playlist_maker.store import DraftStore
 
 
@@ -55,7 +55,8 @@ def test_adapter_selects_hidden_candidate_using_only_local_labels(monkeypatch):
     assert "tools" not in body
     schema = body["generationConfig"]["responseSchema"]
     assert schema["properties"]["choice"]["enum"] == [f"c{i}" for i in range(8)] + ["none"]
-    assert "video_id" not in body["contents"][0]["parts"][0]["text"]
+    sent = request.data.decode()
+    assert "secret" not in sent and not any(c.video_id in sent for c in candidates())
 
 
 @pytest.mark.parametrize("payload", [
@@ -187,17 +188,21 @@ def workflow(tmp_path, monkeypatch):
     store.close()
 
 
-def test_featured_studio_result_is_chosen_without_model_or_manual_prompt(workflow):
+def test_clean_studio_match_is_still_chosen_by_gemini(workflow):
     workflow.search.songs = lambda query: [
         Candidate("remix", "Song (Remix) (feat. Guest)", ["Artist"]),
         Candidate("studio", "Song (feat. Guest)", ["Artist"]),
         Candidate("unclear", "Song (Special Version)", ["Artist"]),
     ]
-    workflow.selector.select = lambda value: pytest.fail("clean studio match should not call Gemini")
+    calls = []
+    def select(value):
+        calls.append(value)
+        return SelectionDecision("studio", "preferred_release")
+    workflow.selector.select = select
     draft = workflow.resolve_pending()
-    assert draft.phase == "title"
-    assert [t.selected for t in draft.tracks] == ["studio", "studio"]
-    assert all(t.selection_record is None for t in draft.tracks)
+    assert draft.phase == "title" and len(calls) == 2
+    assert calls[0].eligible_ids == ("studio",)
+    assert all(t.selected == "studio" and t.selection_record.status == "selected" for t in draft.tracks)
 
 
 def test_ambiguous_featured_releases_reach_gemini_with_alternates_excluded(workflow):
@@ -284,9 +289,14 @@ def test_attempt_is_persisted_before_dispatch_and_selected_results_survive_resta
 @pytest.mark.parametrize("result,reason,record_status,expected_calls", [
     (SelectionDecision(None, "no_match"), "no_match", "no_match", 1),
     (SelectionError("http_429"), "selection_failed", "failed", 3),
+    (SelectionError("transport_error", "timeout"), "selection_failed", "failed", 3),
     (SelectionDecision("live", "preferred_release"), "selection_failed", "failed", 3),
     (SelectionDecision("id1", "no_match"), "selection_failed", "failed", 3),
     (RuntimeError("secret"), "selection_failed", "failed", 3),
+    (SelectionError("http_404"), "selection_failed", "failed", 1),
+    (SelectionError("http_400", "invalid_argument"), "selection_failed", "failed", 1),
+    (SelectionError("request_too_large"), "selection_failed", "failed", 1),
+    (SelectionError("redirect_blocked"), "selection_failed", "failed", 1),
 ])
 def test_skipped_outcomes_persist_and_never_repeat(workflow, result, reason, record_status, expected_calls):
     calls = []
@@ -302,7 +312,45 @@ def test_skipped_outcomes_persist_and_never_repeat(workflow, result, reason, rec
     assert draft.tracks[0].selection_record.status == record_status
     workflow.resolve_pending()
     assert len(calls) == expected_calls * 2  # both source lines are processed once
+    # Only transient failures are retried, with a fixed pause before each retry.
+    assert workflow.delays == [SELECTION_RETRY_DELAY] * (expected_calls - 1) * 2
     assert "secret" not in json.dumps(workflow.active().to_dict())
+
+
+@pytest.mark.parametrize("failures", [1, 2])
+def test_transient_failure_then_success_selects_recording(workflow, failures):
+    calls = []
+    def select(value):
+        calls.append(1)
+        if len(calls) <= failures:
+            raise SelectionError("http_429")
+        return SelectionDecision("id7", "preferred_release")
+    workflow.selector.select = select
+    draft = workflow.resolve_pending()
+    assert [t.status for t in draft.tracks] == ["selected", "selected"]
+    assert draft.tracks[0].selection_record.status == "selected" and draft.tracks[0].skip_reason is None
+    assert len(calls) == failures + 2  # the second line succeeds on its first attempt
+    assert workflow.delays == [SELECTION_RETRY_DELAY] * failures
+
+
+@pytest.mark.parametrize("code,detail", [("http_400", "api_key_invalid"), ("http_401", None),
+                                         ("http_403", "permission_denied"), ("http_403", None)])
+def test_rejected_api_key_stops_run_and_resume_reselects(workflow, code, detail):
+    calls = []
+    def reject(value):
+        calls.append(1)
+        raise SelectionError(code, detail)
+    workflow.selector.select = reject
+    with pytest.raises(WorkflowError, match="GEMINI_API_KEY"):
+        workflow.resolve_pending()
+    draft = workflow.active()
+    assert len(calls) == 1 and workflow.delays == []
+    assert draft.phase == "resolving" and [t.status for t in draft.tracks] == ["pending", "pending"]
+    assert draft.tracks[0].selection_record.status == "attempted"
+    workflow.selector.select = lambda value: SelectionDecision("id7", "preferred_release")
+    draft = workflow.resolve_pending()
+    assert draft.phase == "title" and [t.selected for t in draft.tracks] == ["id7", "id7"]
+    assert workflow.search_queries == ["Artist Song", "Artist Song"]  # stored candidates are reused
 
 
 @pytest.mark.parametrize("mutation", ["cancel", "new_draft", "revision", "snapshot"])
@@ -345,7 +393,7 @@ def test_edit_uses_source_line_keeps_title_and_invalidates_old_create(workflow):
     assert workflow.search_queries[-1] == "Artist Song live"
 
 
-def test_config_optional_key_hidden_and_legacy_json(monkeypatch):
+def test_config_trims_and_hides_key_and_loads_legacy_json(monkeypatch):
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "token")
     monkeypatch.setenv("TELEGRAM_OWNER_ID", "1")
     monkeypatch.setenv("GEMINI_API_KEY", " secret ")
@@ -353,6 +401,29 @@ def test_config_optional_key_hidden_and_legacy_json(monkeypatch):
     assert config.gemini_api_key == "secret" and "secret" not in repr(config)
     legacy = Draft.from_dict({"draft_id": "old", "tracks": [{"artist": "A", "title": "B", "source_line": 1}]})
     assert legacy.review_revision == 0 and legacy.tracks[0].selection_record is None
+
+
+@pytest.mark.parametrize("value", [None, "", "   "])
+def test_config_requires_gemini_key(monkeypatch, value):
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "token")
+    monkeypatch.setenv("TELEGRAM_OWNER_ID", "1")
+    if value is None:
+        monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    else:
+        monkeypatch.setenv("GEMINI_API_KEY", value)
+    with pytest.raises(ValueError, match="Set GEMINI_API_KEY"):
+        bot_config()
+
+
+def test_legacy_manual_flow_draft_loads_and_drops_await_query():
+    legacy = Draft.from_dict({"draft_id": "old", "phase": "resolving", "tracks": [
+        {"artist": "A", "title": "B", "source_line": 1, "status": "pending", "await_query": True,
+         "selection_record": {"provider": "gemini", "model": "m", "policy": "release-selection-v2",
+                              "snapshot_hash": "h", "search_revision": 1, "status": "abstained"}},
+    ]})
+    track = legacy.tracks[0]
+    assert track.status == "pending" and track.selection_record.status == "abstained"
+    assert "await_query" not in json.dumps(legacy.to_dict())
 
 
 def test_selection_ui_progress_runs_on_loop_and_delivery_failure_does_not_affect_choice(workflow):
@@ -365,7 +436,7 @@ def test_selection_ui_progress_runs_on_loop_and_delivery_failure_does_not_affect
                 sent.append(text)
                 if text.startswith("Gemini"):
                     raise OSError("delivery failed")
-        ui = BotUI(BotConfig("dummy", 123, Path("unused")), workflow)
+        ui = BotUI(BotConfig("dummy", 123, Path("unused"), "gemini"), workflow)
         await ui._show_state(SimpleNamespace(effective_message=Message()))
         assert len([t for t in sent if t.startswith("Gemini")]) == 2
         assert sent[-1] == "Selection complete. Send a title for the new playlist."
@@ -373,26 +444,44 @@ def test_selection_ui_progress_runs_on_loop_and_delivery_failure_does_not_affect
     asyncio.run(run())
 
 
-def test_skip_last_edit_cannot_create_empty_playlist(workflow):
+def test_all_skipped_after_edit_stays_editable_and_recovers(workflow):
     workflow.resolve_pending()
     draft = workflow.active()
     draft.tracks[1].status = "skipped"
     workflow.store.save(draft)
     workflow.set_title("Keep title")
-    workflow.edit(2, "query")
+    workflow.edit(2, "typo")
     workflow.selector.select = lambda value: SelectionDecision(None, "no_match")
+    draft = workflow.resolve_pending()
+    assert draft.phase == "confirm" and draft.tracks[0].skip_reason == "no_match"
     with pytest.raises(WorkflowError, match="All songs"):
-        workflow.resolve_pending()
-    with pytest.raises(WorkflowError):
-        workflow.publish(expected_review_revision=0)
+        workflow.publish(expected_review_revision=draft.review_revision)
+    workflow.selector.select = lambda value: SelectionDecision("id7", "preferred_release")
+    workflow.edit(2, "fixed query")
+    draft = workflow.resolve_pending()
+    assert draft.phase == "confirm" and draft.title == "Keep title"
+    assert draft.tracks[0].selected == "id7" and draft.tracks[0].skip_reason is None
 
 
-@pytest.mark.parametrize("state", ["wrong_line", "title", "writing", "playlist", "insert_history", "uncertain", "added"])
+def test_all_skipped_first_pass_allows_edit_before_title(workflow):
+    workflow.selector.select = lambda value: SelectionDecision(None, "no_match")
+    draft = workflow.resolve_pending()
+    assert draft.phase == "title" and {t.skip_reason for t in draft.tracks} == {"no_match"}
+    with pytest.raises(WorkflowError, match="All songs"):
+        workflow.set_title("Title")
+    workflow.selector.select = lambda value: SelectionDecision("id7", "preferred_release")
+    workflow.edit(3, "Artist Song studio")
+    draft = workflow.resolve_pending()
+    assert draft.phase == "title" and draft.tracks[1].selected == "id7"
+    assert workflow.set_title("Title").phase == "confirm"
+
+
+@pytest.mark.parametrize("state", ["wrong_line", "resolving", "writing", "playlist", "insert_history", "uncertain", "added"])
 def test_edit_rejects_invalid_boundary(workflow, state):
     workflow.resolve_pending()
     workflow.set_title("Title")
     draft = workflow.active()
-    if state in ("title", "writing"):
+    if state in ("resolving", "writing"):
         draft.phase = state
     elif state == "playlist":
         draft.playlist_id = "PL"
@@ -405,6 +494,25 @@ def test_edit_rejects_invalid_boundary(workflow, state):
     with pytest.raises(WorkflowError):
         workflow.edit(1 if state == "wrong_line" else 2, "query")
     assert workflow.active().to_dict() == before
+
+
+@pytest.mark.parametrize("query", ["", "   ", "x" * 201])
+def test_edit_rejects_invalid_query_without_changing_state(workflow, query):
+    workflow.resolve_pending()
+    workflow.set_title("Title")
+    before = workflow.active().to_dict()
+    with pytest.raises(WorkflowError, match="between 1 and 200"):
+        workflow.edit(2, query)
+    assert workflow.active().to_dict() == before
+
+
+def test_search_without_results_is_skipped_without_gemini(workflow):
+    workflow.search.songs = lambda query: []
+    workflow.selector.select = lambda value: pytest.fail("no candidates must not reach Gemini")
+    draft = workflow.resolve_pending()
+    assert draft.phase == "title"
+    assert all(t.status == "skipped" and t.skip_reason == "no_results" and t.selection_record is None
+               for t in draft.tracks)
 
 
 def test_edit_after_definitive_creation_429_is_retriable(workflow, monkeypatch):
@@ -431,7 +539,7 @@ def test_ui_edit_owner_only_and_source_line(workflow):
     class Message:
         async def reply_text(self, text, **kwargs):
             sent.append((text, kwargs))
-    ui = BotUI(BotConfig("dummy", 123, Path("unused")), workflow)
+    ui = BotUI(BotConfig("dummy", 123, Path("unused"), "gemini"), workflow)
     update = SimpleNamespace(effective_user=SimpleNamespace(id=456),
                              effective_chat=SimpleNamespace(type=ChatType.PRIVATE), effective_message=Message())
     asyncio.run(ui.edit(update, SimpleNamespace(args=["2", "Artist", "live"])))
@@ -456,7 +564,7 @@ def test_ui_stale_and_legacy_create_buttons_rejected_after_edit(workflow):
             sent.append(text)
     async def answer():
         pass
-    ui = BotUI(BotConfig("dummy", 123, Path("unused")), workflow)
+    ui = BotUI(BotConfig("dummy", 123, Path("unused"), "gemini"), workflow)
     for suffix in ("create", "create:0"):
         update = SimpleNamespace(effective_user=SimpleNamespace(id=123),
             effective_chat=SimpleNamespace(type=ChatType.PRIVATE), effective_message=Message(),
@@ -520,7 +628,7 @@ def test_response_failure_categories_are_safe(monkeypatch, payload, category):
     assert caught.value.code == "invalid_response" and caught.value.detail == category
 
 
-@pytest.mark.parametrize("code,detail", [("http_400", "api_key_invalid"), ("invalid_response", "max_tokens"),
+@pytest.mark.parametrize("code,detail", [("http_400", "invalid_argument"), ("invalid_response", "max_tokens"),
                                          ("transport_error", "timeout"), ("secret", "secret")])
 def test_failed_workflow_logs_and_persists_only_safe_diagnostics(workflow, caplog, code, detail):
     def fail(value):
@@ -622,10 +730,13 @@ def test_old_model_pending_record_is_reselected_from_stored_candidates(workflow,
         track.candidates = candidates()
         track.search_query = "Artist Song"
         track.search_revision = 1
-        track.selection_record = SelectionRecord("gemini", "gemini-2.5-flash-lite", selection.POLICY,
+        track.selection_record = SelectionRecord("gemini", "gemini-2.5-flash-lite", "release-selection-v2",
                                                  "legacy snapshot hash", 1, status=status)
     workflow.store.save(draft)
     workflow.search.songs = lambda query: pytest.fail("stored candidates must not be searched again")
     reloaded = workflow.resolve_pending()
     assert all(t.selected == "id7" and t.selection_record.status == "selected" and t.search_revision == 1
                for t in reloaded.tracks)
+    record = reloaded.tracks[0].selection_record
+    assert (record.model, record.policy) == (selection.MODEL, selection.POLICY)
+    assert record.snapshot_hash != "legacy snapshot hash"

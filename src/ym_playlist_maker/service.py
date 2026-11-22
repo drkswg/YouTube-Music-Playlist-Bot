@@ -20,6 +20,13 @@ log = logging.getLogger(__name__)
 
 SELECTION_ATTEMPTS = 3
 SELECTION_RETRY_DELAY = 2
+# Only these failures can succeed on a later attempt; others are skipped immediately.
+TRANSIENT_SELECTION_ERRORS = frozenset({"http_429", "http_error", "transport_error", "invalid_response",
+                                        "selector_error"})
+# A rejected key fails every line; stop the run instead of skipping the whole list.
+KEY_REJECTED_CODES = frozenset({"http_401", "http_403"})
+KEY_REJECTED_DETAILS = frozenset({"api_key_invalid", "permission_denied"})
+ALL_SKIPPED = "All songs have been skipped. Use /edit <source line> <search query> to search again or /cancel"
 
 
 class WorkflowError(RuntimeError):
@@ -77,15 +84,13 @@ class PlaylistWorkflow:
                 reason = resolve_candidates(
                     track, track.candidates, is_custom=track.search_query not in ("", canonical)).reason
                 self._select(draft, track, reason, on_selection_pending)
-        if draft.title and not any(t.status == "selected" for t in draft.tracks):
-            raise WorkflowError("All songs have been skipped; use /cancel")
         draft.phase = "confirm" if draft.title else "title"
         self.store.save(draft)
         return draft
 
     def edit(self, source_line: int, query: str) -> Draft:
         draft = self._require()
-        if draft.phase != "confirm" or draft.playlist_id or any(
+        if draft.phase not in ("title", "confirm") or draft.playlist_id or any(
             t.insert_revision or t.status in ("added", "uncertain") for t in draft.tracks
         ):
             raise WorkflowError("Editing is available only before playlist creation")
@@ -115,7 +120,7 @@ class PlaylistWorkflow:
         if not title or len(title) > 150:
             raise WorkflowError("The title must be between 1 and 150 characters long")
         if not any(t.status == "selected" for t in draft.tracks):
-            raise WorkflowError("All songs have been skipped; use /cancel")
+            raise WorkflowError(ALL_SKIPPED)
         draft.title = title
         draft.phase = "confirm"
         self.store.save(draft)
@@ -167,7 +172,7 @@ class PlaylistWorkflow:
             if privacy not in ("private", "public"):
                 raise ValueError("Playlist privacy must be private or public")
             if not any(t.status == "selected" and t.selected for t in draft.tracks):
-                raise WorkflowError("All songs have been skipped; use /cancel")
+                raise WorkflowError(ALL_SKIPPED)
             # Fail before entering the uncertain creation phase when credentials are missing.
             self.youtube.check_credentials()
             draft.privacy = privacy
@@ -297,11 +302,6 @@ class PlaylistWorkflow:
                      track.source_line, track.skip_reason, 0, 0)
             self.store.save(draft)
             return
-        if decision.selected_video_id is not None:
-            track.selected = decision.selected_video_id
-            track.status = "selected"
-            self.store.save(draft)
-            return
         self.store.save(draft)  # Persist the exact fresh snapshot before any model call.
         self._select(draft, track, decision.reason, on_selection_pending)
 
@@ -341,6 +341,11 @@ class PlaylistWorkflow:
                 error_detail = None
             log.warning("Gemini selection failed: model=%s source_line=%s attempt=%s/%s error_code=%s error_detail=%s",
                         MODEL, track.source_line, attempt, SELECTION_ATTEMPTS, error_code, error_detail or "none")
+            if error_code in KEY_REJECTED_CODES or error_detail in KEY_REJECTED_DETAILS:
+                # The attempted record stays pending, so /resume re-runs selection with the fixed key.
+                raise WorkflowError("Gemini rejected the API key. Check GEMINI_API_KEY, restart the bot and use /resume")
+            if error_code not in TRANSIENT_SELECTION_ERRORS:
+                break
         current = self.active()
         index = draft.tracks.index(track)
         if current is None or current.draft_id != draft.draft_id or current.phase != "resolving":
