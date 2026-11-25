@@ -53,7 +53,7 @@ def main() -> None:
     store = DraftStore(config.directory / "state.sqlite3")
     try:
         workflow = PlaylistWorkflow(store, MusicSearch(), YouTubePlaylists(config.directory / "token.json"),
-                                    GeminiSelector(config.gemini_api_key) if config.gemini_api_key else None)
+                                    GeminiSelector(config.gemini_api_key))
         build_application(config, workflow).run_polling(allowed_updates=Update.ALL_TYPES)
     except Exception as exc:
         logging.getLogger(__name__).error("Bot stopped: error_type=%s", type(exc).__name__)

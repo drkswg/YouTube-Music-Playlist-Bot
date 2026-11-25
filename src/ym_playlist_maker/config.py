@@ -18,7 +18,7 @@ class BotConfig:
     token: str = field(repr=False)
     owner_id: int
     directory: Path
-    gemini_api_key: str = field(default="", repr=False)
+    gemini_api_key: str = field(repr=False)
 
 
 def bot_config() -> BotConfig:
@@ -28,6 +28,8 @@ def bot_config() -> BotConfig:
         raise ValueError("Set TELEGRAM_BOT_TOKEN")
     if not owner.isdecimal() or int(owner) <= 0:
         raise ValueError("TELEGRAM_OWNER_ID must be a positive numeric ID")
-    return BotConfig(token=token, owner_id=int(owner), directory=data_dir(),
-                     gemini_api_key=os.environ.get("GEMINI_API_KEY", "").strip())
+    gemini = os.environ.get("GEMINI_API_KEY", "").strip()
+    if not gemini:
+        raise ValueError("Set GEMINI_API_KEY")
+    return BotConfig(token=token, owner_id=int(owner), directory=data_dir(), gemini_api_key=gemini)
 

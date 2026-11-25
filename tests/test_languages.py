@@ -13,10 +13,11 @@ from telegram import BotCommandScopeChat
 from telegram.constants import ChatType
 from telegram.error import BadRequest
 
-from ym_playlist_maker.bot import BotUI, selection_fallback_message
+from ym_playlist_maker.bot import BotUI
 from ym_playlist_maker.config import BotConfig
 from ym_playlist_maker.i18n import LANGUAGES, _CATALOG, translate, translate_saved_message
-from ym_playlist_maker.models import Candidate, Draft, SelectionRecord, Track
+from ym_playlist_maker.models import Candidate, Draft, Track
+from ym_playlist_maker.selection import SelectionDecision
 from ym_playlist_maker.service import PlaylistWorkflow, UnconfirmedInsert, WorkflowError
 from ym_playlist_maker.store import DraftStore
 
@@ -44,9 +45,17 @@ def make_context(args=()):
         )),
     )
 
+class FakeSelector:
+    def __init__(self):
+        self.calls = []
+
+    def select(self, value):
+        self.calls.append(value)
+        return SelectionDecision(value.candidates[0].video_id, "preferred_release")
+
 
 def make_ui(store):
-    return BotUI(BotConfig("dummy", 123, Path("unused")), PlaylistWorkflow(store, search=None, youtube=None))
+    return BotUI(BotConfig("dummy", 123, Path("unused"), "gemini"), PlaylistWorkflow(store, search=None, youtube=None, selector=FakeSelector()))
 
 
 def test_language_picker_uses_native_names_and_current_choice_without_a_draft(tmp_path):
@@ -207,10 +216,10 @@ def test_localized_review_actions_remain_usable(tmp_path, monkeypatch, code, act
     store = DraftStore(tmp_path / "state.sqlite3")
     store.set_language(code)
     youtube = FakeYouTube()
-    workflow = PlaylistWorkflow(store, FakeSearch(), youtube)
+    workflow = PlaylistWorkflow(store, FakeSearch(), youtube, FakeSelector())
     draft = prepare(workflow)
     before = draft.to_dict()
-    ui = BotUI(BotConfig("dummy", 123, Path("unused")), workflow)
+    ui = BotUI(BotConfig("dummy", 123, Path("unused"), "gemini"), workflow)
     update = make_update()
     asyncio.run(ui.resume(update, None))
     rows = update.effective_message.sent[-1][1]["reply_markup"].inline_keyboard
@@ -239,24 +248,6 @@ def test_localized_review_actions_remain_usable(tmp_path, monkeypatch, code, act
         assert translate(code, "Done: {added} songs. {url}", added=2,
                          url="https://music.youtube.com/playlist?list=playlist1") in callback.effective_message.sent[-1][0]
     assert store.get_language() == code
-    store.close()
-
-
-def test_existing_recording_button_still_works_after_language_change(tmp_path):
-    store = DraftStore(tmp_path / "state.sqlite3")
-    draft = Draft("draft123", [Track("Artist", "Song", 1, candidates=[
-        Candidate("first", "Song (Live)", ["Artist"]), Candidate("second", "Song", ["Artist"]),
-    ], search_query="Artist Song", search_revision=4)])
-    store.save(draft)
-    ui = make_ui(store)
-    asyncio.run(ui.language(make_update(), make_context(["ru"])))
-    update = make_update(data="d:draft123:pick:0:4:1")
-    asyncio.run(ui.callback(update, None))
-    saved = store.load()
-    assert saved.tracks[0].selected == "second"
-    assert saved.tracks[0].status == "selected"
-    assert saved.phase == "title"
-    assert update.effective_message.sent[0][0] == "Выбор завершён. Отправьте название нового плейлиста."
     store.close()
 
 
@@ -292,21 +283,13 @@ def test_failed_preference_write_keeps_previous_language(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("code", ["ru", "es", "de", "fr", "pt"])
-def test_localized_search_and_uncertain_insertion_preserve_safety_buttons(tmp_path, code):
+def test_localized_uncertain_insertion_preserves_safety_button(tmp_path, code):
     store = DraftStore(tmp_path / "state.sqlite3")
     store.set_language(code)
     track = Track("Artist", "Song", 3, candidates=[Candidate("id", "Song (Live)", ["Artist"])],
                   search_query="Artist Song", search_revision=9)
     draft = Draft("draft123", [track])
-    store.save(draft)
     ui = make_ui(store)
-    update = make_update()
-    asyncio.run(ui.resume(update, None))
-    text, options = update.effective_message.sent[0]
-    assert "Artist — Song" in text
-    assert "The requested version was not found" not in text
-    assert options["reply_markup"].inline_keyboard[0][0].callback_data == "d:draft123:pick:0:9:0"
-    assert options["reply_markup"].inline_keyboard[-1][0].text != "Skip"
 
     draft.phase = "writing"
     draft.playlist_id = "PL123"
@@ -325,17 +308,13 @@ def test_localized_search_and_uncertain_insertion_preserve_safety_buttons(tmp_pa
     store.close()
 
 
-def test_russian_validation_gemini_fallback_and_saved_error_are_localized(tmp_path):
+def test_russian_validation_and_saved_error_are_localized(tmp_path):
     store = DraftStore(tmp_path / "state.sqlite3")
     store.set_language("ru")
     ui = make_ui(store)
     update = make_update()
     asyncio.run(ui._error(update, WorkflowError("The title must be between 1 and 150 characters long")))
     assert "Название должно содержать от 1 до 150 символов" in update.effective_message.sent[0][0]
-    record = SelectionRecord(provider="gemini", model="test", policy="test", snapshot_hash="snapshot",
-                             search_revision=1, status="failed", error_code="http_429")
-    assert "бесплатной квоты" in selection_fallback_message(record, "ru")
-    assert "Выберите вручную" in selection_fallback_message(record, "ru")
     draft = Draft("done", [], phase="done", playlist_id="PL123",
                   errors=["Line 3: YouTube rejected the recording (404)"])
     update = make_update()
@@ -372,3 +351,27 @@ def test_old_duplicate_diagnostic_is_localized(language):
     source = "Line 17: duplicate recording skipped"
     translated = translate_saved_message(language, source)
     assert translated != source and "17" in translated
+
+
+@pytest.mark.parametrize("language", ["ru", "es", "de", "fr", "pt"])
+def test_skip_report_and_selection_errors_are_localized(tmp_path, language):
+    store = DraftStore(tmp_path / "state.sqlite3")
+    store.set_language(language)
+    ui = make_ui(store)
+    english = make_ui(DraftStore(tmp_path / "english.sqlite3"))
+    english.language_code = "en"
+    reasons = ["no_results", "no_match", "selection_failed"]
+    draft = Draft("d", [Track("Oasis", "Wonderwall", i + 1, status="skipped", skip_reason=reason)
+                        for i, reason in enumerate(reasons)], phase="confirm", title="T")
+    report = ui._skip_report(draft)
+    assert len(report) == 3 and len(set(report)) == 3
+    for line, (number, source) in zip(report, enumerate(english._skip_report(draft), 1)):
+        assert line != source and str(number) in line and "Oasis — Wonderwall" in line
+    for message in ("All songs have been skipped. Use /edit <source line> <search query> to search again or /cancel",
+                    "Gemini rejected the API key. Check GEMINI_API_KEY, restart the bot and use /resume"):
+        update = make_update()
+        asyncio.run(ui._error(update, WorkflowError(message)))
+        text = update.effective_message.sent[0][0]
+        assert message not in text and ("GEMINI_API_KEY" in text or "/edit" in text)
+    english.store.close()
+    store.close()
