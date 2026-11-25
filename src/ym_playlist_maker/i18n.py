@@ -114,6 +114,11 @@ _CATALOG: dict[str, tuple[str, ...]] = {
         " · альбом: {album}", " · álbum: {album}", " · Album: {album}",
         " · album : {album}", " · álbum: {album}",
     ),
+    " · artist and title order corrected": (
+        " · порядок исполнителя и названия исправлен", " · se corrigió el orden de artista y título",
+        " · Reihenfolge von Interpret und Titel korrigiert", " · ordre artiste/titre corrigé",
+        " · ordem de artista e título corrigida",
+    ),
     "Selection complete. Send a title for the new playlist.": (
         "Выбор завершён. Отправьте название нового плейлиста.",
         "Selección completada. Envía un título para la nueva lista.",

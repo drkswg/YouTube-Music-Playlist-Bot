@@ -506,6 +506,77 @@ def test_edit_rejects_invalid_query_without_changing_state(workflow, query):
     assert workflow.active().to_dict() == before
 
 
+def gaga_results(query):
+    return [
+        Candidate("cover", "Poker Face (Made Popular By Lady Gaga) [Vocal Version]", ["Party Tyme Karaoke"]),
+        Candidate("original", "Poker Face", ["Lady Gaga"], "The Fame", "3:58"),
+        Candidate("other", "Bad Romance", ["Lady Gaga"], "The Fame Monster", "4:55"),
+    ]
+
+
+def test_reversed_song_and_artist_is_corrected_before_gemini(workflow):
+    workflow.cancel()
+    workflow.start("Poker Face — Lady Gaga")
+    workflow.search.songs = gaga_results
+    seen = []
+    def select(value):
+        seen.append(value)
+        return SelectionDecision("original", "preferred_release")
+    workflow.selector.select = select
+    draft = workflow.resolve_pending()
+    track = draft.tracks[0]
+    assert (seen[0].artist, seen[0].title, seen[0].eligible_ids) == ("Lady Gaga", "Poker Face", ("original",))
+    assert (track.artist, track.title, track.order_swapped, track.selected) == ("Lady Gaga", "Poker Face", True, "original")
+    reloaded = workflow.active().tracks[0]
+    assert reloaded.order_swapped and reloaded.search_query == "Poker Face Lady Gaga"
+
+
+def test_correct_order_and_unmatched_lines_are_not_swapped(workflow):
+    workflow.cancel()
+    workflow.start("Lady Gaga — Poker Face\nNobody — Lady Gaga")
+    workflow.search.songs = gaga_results
+    seen = []
+    def select(value):
+        seen.append((value.artist, value.title))
+        return SelectionDecision(None, "no_match") if value.artist == "Nobody" else SelectionDecision("original", "preferred_release")
+    workflow.selector.select = select
+    draft = workflow.resolve_pending()
+    assert seen == [("Lady Gaga", "Poker Face"), ("Nobody", "Lady Gaga")]
+    assert [t.order_swapped for t in draft.tracks] == [False, False]
+
+
+def test_edit_with_correct_order_fixes_reversed_line(workflow):
+    workflow.cancel()
+    workflow.start("Poker Face — Lady Gaga")
+    workflow.search.songs = lambda query: []
+    assert workflow.resolve_pending().tracks[0].skip_reason == "no_results"
+    workflow.search.songs = gaga_results
+    workflow.selector.select = lambda value: SelectionDecision("original", "preferred_release")
+    workflow.edit(1, "Lady Gaga Poker Face")
+    draft = workflow.resolve_pending()
+    assert draft.tracks[0].order_swapped and draft.tracks[0].artist == "Lady Gaga"
+    assert draft.tracks[0].selected == "original"
+
+
+def test_resumed_reversed_line_is_not_treated_as_custom_search(workflow):
+    workflow.cancel()
+    workflow.start("Poker Face — Lady Gaga")
+    workflow.search.songs = gaga_results
+    reasons = []
+    def reject(value):
+        reasons.append(value.rules_reason)
+        raise SelectionError("http_401")
+    workflow.selector.select = reject
+    with pytest.raises(WorkflowError):
+        workflow.resolve_pending()
+    def select(value):
+        reasons.append(value.rules_reason)
+        return SelectionDecision("original", "preferred_release")
+    workflow.selector.select = select
+    assert workflow.resolve_pending().tracks[0].selected == "original"
+    assert reasons[0] == reasons[1] != "custom_search"
+
+
 def test_search_without_results_is_skipped_without_gemini(workflow):
     workflow.search.songs = lambda query: []
     workflow.selector.select = lambda value: pytest.fail("no candidates must not reach Gemini")

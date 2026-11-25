@@ -331,6 +331,8 @@ class BotUI:
                     detail += f" · {candidate.duration}"
                 if candidate.video_id in seen:
                     detail += self._t(" · duplicate will be skipped")
+                if track.order_swapped:
+                    detail += self._t(" · artist and title order corrected")
                 seen.add(candidate.video_id)
                 lines.append(detail)
             if skipped:

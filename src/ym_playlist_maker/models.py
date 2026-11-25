@@ -44,6 +44,8 @@ class Track:
     insert_revision: int = 0
     selection_record: SelectionRecord | None = None
     skip_reason: Literal["no_results", "no_match", "selection_failed"] | None = None
+    # Set when the line was written as "Song — Artist" and the parts were swapped.
+    order_swapped: bool = False
 
     @classmethod
     def from_dict(cls, value: dict) -> "Track":

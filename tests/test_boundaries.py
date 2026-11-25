@@ -210,6 +210,19 @@ def test_confirmation_lists_every_selection_in_telegram_safe_chunks():
     assert message.sent[-1][1]["reply_markup"]
 
 
+def test_review_marks_corrected_artist_and_title_order():
+    candidate = Candidate("original", "Poker Face", ["Lady Gaga"], "The Fame", "3:58")
+    track = Track("Lady Gaga", "Poker Face", 1, candidates=[candidate], selected="original",
+                  status="selected", order_swapped=True)
+    draft = Draft("draft123", [track], phase="confirm", title="Mix")
+    ui = BotUI(BotConfig("dummy", 123, Path("unused"), "gemini"),
+               SimpleNamespace(resolve_pending=lambda **kwargs: draft))
+    message = CollectMessage()
+    asyncio.run(ui._show_state(SimpleNamespace(effective_message=message)))
+    assert ("1. Poker Face — Lady Gaga · album: The Fame · 3:58 · artist and title order corrected"
+            in message.sent[0][0])
+
+
 @pytest.fixture
 def review_ui(tmp_path, monkeypatch):
     from ym_playlist_maker.service import PlaylistWorkflow

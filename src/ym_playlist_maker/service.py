@@ -81,8 +81,9 @@ class PlaylistWorkflow:
                 self._search_into(draft, track, query, is_custom=query != canonical,
                                   on_selection_pending=on_selection_pending)
             else:
+                original = f"{track.title} {track.artist}" if track.order_swapped else canonical
                 reason = resolve_candidates(
-                    track, track.candidates, is_custom=track.search_query not in ("", canonical)).reason
+                    track, track.candidates, is_custom=track.search_query not in ("", canonical, original)).reason
                 self._select(draft, track, reason, on_selection_pending)
         draft.phase = "confirm" if draft.title else "title"
         self.store.save(draft)
@@ -289,6 +290,13 @@ class PlaylistWorkflow:
     def _search_into(self, draft: Draft, track: Track, query: str, *, is_custom: bool = False,
                      on_selection_pending: Callable[[int, int], None] | None = None) -> None:
         candidates = self.search.songs(query)
+        if candidates and not eligible_candidates(track, candidates) and eligible_candidates(
+            Track(track.title, track.artist, track.source_line), candidates
+        ):
+            # The line was written as "Song — Artist"; only the reversed order matches the results.
+            track.artist, track.title = track.title, track.artist
+            track.order_swapped = not track.order_swapped
+            log.info("Artist and title order corrected: source_line=%s", track.source_line)
         decision = resolve_candidates(track, candidates, is_custom=is_custom)
         track.candidates = list(decision.ordered_candidates)
         track.search_query = query
